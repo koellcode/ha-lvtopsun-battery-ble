@@ -364,6 +364,15 @@ async def _run_gatttool(address: str, connect_timeout: float,
         # 2. Let BMS settle (name changes to ASR ~0.5s after connect)
         await asyncio.sleep(1.0)
 
+        # 2b. Request larger MTU — BMS sends 100-byte indication chunks
+        #     which exceed the default ATT MTU of 23 (20-byte payload).
+        await send_cmd("mtu 200")
+        try:
+            await read_until("MTU was exchanged", timeout=5.0)
+            LOG.info("MTU exchanged")
+        except TimeoutError:
+            LOG.warning("MTU exchange timed out (proceeding anyway)")
+
         # 3. Read FF01 (handshake — should return "C2 Value")
         await send_cmd(f"char-read-hnd 0x{FF01_VALUE_HANDLE:04x}")
         try:
