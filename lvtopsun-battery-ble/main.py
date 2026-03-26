@@ -329,11 +329,13 @@ async def read_once(opts):
         disconnected_event.set()
 
     last_exc = None
-    for connect_attempt in range(1, 4):
+    max_attempts = 5
+    for connect_attempt in range(1, max_attempts + 1):
         try:
             LOG.info(
-                "BLE connect attempt %d/3 to %s",
+                "BLE connect attempt %d/%d to %s",
                 connect_attempt,
+                max_attempts,
                 device.address,
             )
             disconnected_event.clear()
@@ -351,21 +353,9 @@ async def read_once(opts):
                     for char in svc.characteristics:
                         LOG.debug("  Char: %s  props=%s", char.uuid, char.properties)
 
-                # Short settle delay after connect
-                await asyncio.sleep(0.3)
-
-                # Subscribe to notifications/indications on FF01
+                # Subscribe to notifications/indications on FF01 immediately
                 LOG.info("Subscribing to FF01 indications...")
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
-
-                # Read FF01 immediately as a keep-alive ping — some BMS
-                # firmware drops the connection after ~4 s of idle time.
-                try:
-                    init_val = await client.read_gatt_char(CHAR_FF01_UUID)
-                    LOG.debug("Initial FF01 read: %d bytes", len(init_val))
-                    assembler.feed(bytes(init_val))
-                except Exception as exc:
-                    LOG.debug("Initial FF01 read failed (non-fatal): %s", exc)
 
                 try:
                     # Clear disconnect flag right before waiting — BlueZ may
@@ -419,17 +409,17 @@ async def read_once(opts):
             if got_frame.is_set():
                 break  # Success — no need to retry
             # If we connected but got no frame, still retry
-            if connect_attempt < 3:
-                LOG.info("Connected but no frame — retrying after 5s")
-                await asyncio.sleep(5)
+            if connect_attempt < max_attempts:
+                LOG.info("Connected but no frame — retrying after 2s")
+                await asyncio.sleep(2)
                 continue
             break
 
         except Exception as exc:
             last_exc = exc
             LOG.warning("BLE connect/discovery attempt %d failed: %s", connect_attempt, exc)
-            if connect_attempt < 3:
-                await asyncio.sleep(5)
+            if connect_attempt < max_attempts:
+                await asyncio.sleep(2)
 
     if last_exc is not None:
         LOG.error("BLE error: %s", last_exc)
