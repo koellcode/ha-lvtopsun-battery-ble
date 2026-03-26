@@ -380,18 +380,28 @@ async def _run_gatttool(address: str, connect_timeout: float,
 
         LOG.info("Waiting for indications (timeout=%.0fs)...", frame_timeout)
         last_activity = time.time()
+        last_trigger = time.time()
+        trigger_interval = 30.0  # re-read FF01 every 30s as nudge
 
         # 4. Stream loop
         while True:
             try:
                 line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=30.0,
+                    proc.stdout.readline(), timeout=10.0,
                 )
             except asyncio.TimeoutError:
                 idle = time.time() - last_activity
                 if idle >= frame_timeout:
                     LOG.warning("No data for %.0fs; reconnecting", idle)
                     break
+                # Periodically re-read FF01 as trigger while idle
+                since_trigger = time.time() - last_trigger
+                if since_trigger >= trigger_interval:
+                    LOG.info("Sending FF01 read trigger (idle %.0fs)",
+                             idle)
+                    await send_cmd(
+                        f"char-read-hnd 0x{FF01_VALUE_HANDLE:04x}")
+                    last_trigger = time.time()
                 continue
 
             if not line:
