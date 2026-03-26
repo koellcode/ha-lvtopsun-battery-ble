@@ -42,6 +42,7 @@ def load_options():
         "connect_timeout": int(os.environ.get("CONNECT_TIMEOUT", "30")),
         "frame_timeout": int(os.environ.get("FRAME_TIMEOUT", "120")),
         "poll_interval": int(os.environ.get("POLL_INTERVAL", "30")),
+        "retry_delay": int(os.environ.get("RETRY_DELAY", "10")),
         "mqtt_host": os.environ.get("MQTT_HOST", ""),
         "mqtt_port": int(os.environ.get("MQTT_PORT", "1883")),
         "mqtt_username": os.environ.get("MQTT_USERNAME", ""),
@@ -381,6 +382,7 @@ async def read_once(opts):
                 # Subscribe to notifications/indications on FF01 immediately
                 LOG.info("Subscribing to FF01 indications...")
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
+                await _enable_indications_manually(client, CHAR_FF01_UUID)
 
                 try:
                     # Clear disconnect flag right before waiting — BlueZ may
@@ -480,32 +482,21 @@ async def run():
     publish_ha_discovery(mqttc, topic_base)
     publish_availability(mqttc, topic_base, True)
 
-    consecutive_failures = 0
-    max_backoff = 300  # 5 min max
+    retry_delay = max(int(opts.get("retry_delay", 10)), 1)
 
     try:
         while True:
             soc = await read_once(opts)
             if soc is not None:
                 publish_state(mqttc, topic_base, soc)
-                publish_availability(mqttc, topic_base, True)
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
-                publish_availability(mqttc, topic_base, False)
-                LOG.warning(
-                    "Read failed (%d consecutive). Will retry.",
-                    consecutive_failures,
-                )
-
-            # Backoff: normal interval, or exponential on failure (capped)
-            if consecutive_failures == 0:
                 delay = opts["poll_interval"]
             else:
-                delay = min(
-                    opts["poll_interval"] * (2 ** consecutive_failures),
-                    max_backoff,
+                LOG.warning(
+                    "Read failed. Retaining last published SOC and retrying in %ds.",
+                    retry_delay,
                 )
+                delay = retry_delay
+
             LOG.info("Next poll in %ds", delay)
             await asyncio.sleep(delay)
     except asyncio.CancelledError:
