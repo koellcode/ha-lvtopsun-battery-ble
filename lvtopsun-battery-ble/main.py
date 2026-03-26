@@ -20,6 +20,7 @@ import paho.mqtt.client as mqtt
 # Constants
 # ---------------------------------------------------------------------------
 CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+CHAR_FF00_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
@@ -232,6 +233,15 @@ def decode_pack_voltage(frame: bytes):
     return raw / 100.0
 
 
+def parse_hex_bytes(value: str):
+    if not value:
+        return None
+    cleaned = value.replace(" ", "").strip()
+    if not cleaned:
+        return None
+    return bytes.fromhex(cleaned)
+
+
 # ---------------------------------------------------------------------------
 # MQTT helpers
 # ---------------------------------------------------------------------------
@@ -373,8 +383,18 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
     probe_interval = max(float(opts.get("probe_interval", 5)), 1.0)
-    subscribe_settle_delay = max(float(opts.get("subscribe_settle_delay", 1.0)), 0.0)
-    post_subscribe_delay = max(float(opts.get("post_subscribe_delay", 1.0)), 0.0)
+    subscribe_settle_delay = max(float(opts.get("subscribe_settle_delay", 0.0)), 0.0)
+    post_subscribe_delay = max(float(opts.get("post_subscribe_delay", 0.0)), 0.0)
+    ff00_request_hex = (opts.get("ff00_request_hex") or "").strip()
+    ff00_request_timing = (opts.get("ff00_request_timing") or "before-subscribe").strip().lower()
+    ff00_request_response = bool(opts.get("ff00_request_response", False))
+    ff00_request_payload = None
+    if ff00_request_hex:
+        try:
+            ff00_request_payload = parse_hex_bytes(ff00_request_hex)
+        except ValueError as exc:
+            LOG.error("Invalid ff00_request_hex: %s", exc)
+            ff00_request_payload = None
 
     disconnected_event = asyncio.Event()
     monitor_stop_event = asyncio.Event()
@@ -414,6 +434,22 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     def on_disconnect(_client):
         LOG.warning("BLE device disconnected unexpectedly during phase=%s", phase)
         disconnected_event.set()
+
+    async def maybe_send_ff00_request(client, when: str):
+        if ff00_request_payload is None or ff00_request_timing != when:
+            return
+        set_phase(f"ff00-request-{when}")
+        LOG.info(
+            "Sending FF00 request (%d bytes) timing=%s response=%s",
+            len(ff00_request_payload),
+            when,
+            ff00_request_response,
+        )
+        await client.write_gatt_char(
+            CHAR_FF00_UUID,
+            ff00_request_payload,
+            response=ff00_request_response,
+        )
 
     async def start_notify_with_retry(client):
         attempts = 2
@@ -488,6 +524,10 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                     for char in svc.characteristics:
                         LOG.debug("  Char: %s  props=%s", char.uuid, char.properties)
 
+                await maybe_send_ff00_request(client, "before-subscribe")
+                if disconnected_event.is_set() or not client.is_connected:
+                    raise RuntimeError("Disconnected after FF00 request before subscribe")
+
                 # Subscribe to notifications/indications on FF01 after a short settle period.
                 set_phase("subscribe-ff01")
                 await start_notify_with_retry(client)
@@ -495,6 +535,10 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                 try:
                     disconnected_event.clear()
                     last_frame_ts = time.time()
+
+                    await maybe_send_ff00_request(client, "after-subscribe")
+                    if disconnected_event.is_set() or not client.is_connected:
+                        raise RuntimeError("Disconnected after FF00 request after subscribe")
 
                     if post_subscribe_delay > 0:
                         set_phase("post-subscribe-settle")
