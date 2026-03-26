@@ -1,6 +1,6 @@
 name: "LVTOPSUN Battery BLE"
 description: "Reads SOC from LVTOPSUN LiFePO4 battery via BLE and publishes to MQTT"
-version: "0.1.6"
+version: "0.1.7"
 slug: lvtopsun-battery-ble
 url: "https://github.com/koellcode/ha-lvtopsun-battery-ble"
 arch:
@@ -15,7 +15,7 @@ host_network: true
 options:
   device_name: "LLM_UNAZAY_0008FR"
   scan_timeout: 10
-  connect_timeout: 15
+  connect_timeout: 30
   frame_timeout: 120
   poll_interval: 30
   mqtt_host: ""
