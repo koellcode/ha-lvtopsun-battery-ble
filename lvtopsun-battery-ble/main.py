@@ -373,6 +373,8 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
     probe_interval = max(float(opts.get("probe_interval", 5)), 1.0)
+    subscribe_settle_delay = max(float(opts.get("subscribe_settle_delay", 1.0)), 0.0)
+    post_subscribe_delay = max(float(opts.get("post_subscribe_delay", 1.0)), 0.0)
 
     disconnected_event = asyncio.Event()
     monitor_stop_event = asyncio.Event()
@@ -413,6 +415,32 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
         LOG.warning("BLE device disconnected unexpectedly during phase=%s", phase)
         disconnected_event.set()
 
+    async def start_notify_with_retry(client):
+        attempts = 2
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            try:
+                LOG.info("Subscribing to FF01 indications (attempt %d/%d)...", attempt, attempts)
+                await client.start_notify(CHAR_FF01_UUID, on_notify)
+                return
+            except Exception as exc:
+                last_error = exc
+                err_text = str(exc)
+                LOG.warning(
+                    "FF01 subscribe attempt %d/%d failed during phase=%s: %s",
+                    attempt,
+                    attempts,
+                    phase,
+                    exc,
+                )
+                if "ATT error: 0x0e" not in err_text or attempt >= attempts:
+                    raise
+                if disconnected_event.is_set() or not client.is_connected:
+                    raise
+                LOG.info("Retrying FF01 subscribe after %.1fs settle due to ATT 0x0e", subscribe_settle_delay)
+                await asyncio.sleep(max(subscribe_settle_delay, 0.5))
+        raise last_error
+
     last_exc = None
     max_attempts = 5
     for connect_attempt in range(1, max_attempts + 1):
@@ -446,20 +474,35 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                 LOG.info("BLE connected: %s", client.is_connected)
                 set_phase("service-discovery")
 
+                if subscribe_settle_delay > 0:
+                    set_phase("pre-subscribe-settle")
+                    LOG.info("Settling connection for %.1fs before subscribe", subscribe_settle_delay)
+                    await asyncio.sleep(subscribe_settle_delay)
+                    if disconnected_event.is_set() or not client.is_connected:
+                        raise RuntimeError("Disconnected during pre-subscribe settle")
+                    set_phase("service-discovery")
+
                 # Log discovered services for debugging
                 for svc in client.services:
                     LOG.debug("Service: %s", svc.uuid)
                     for char in svc.characteristics:
                         LOG.debug("  Char: %s  props=%s", char.uuid, char.properties)
 
-                # Subscribe to notifications/indications on FF01 immediately
-                LOG.info("Subscribing to FF01 indications...")
+                # Subscribe to notifications/indications on FF01 after a short settle period.
                 set_phase("subscribe-ff01")
-                await client.start_notify(CHAR_FF01_UUID, on_notify)
+                await start_notify_with_retry(client)
 
                 try:
                     disconnected_event.clear()
                     last_frame_ts = time.time()
+
+                    if post_subscribe_delay > 0:
+                        set_phase("post-subscribe-settle")
+                        LOG.info("Settling session for %.1fs after subscribe", post_subscribe_delay)
+                        await asyncio.sleep(post_subscribe_delay)
+                        if disconnected_event.is_set() or not client.is_connected:
+                            raise RuntimeError("Disconnected during post-subscribe settle")
+
                     set_phase("streaming")
                     LOG.info(
                         "Streaming BMS frames; idle timeout %.1fs; check interval %.1fs",
