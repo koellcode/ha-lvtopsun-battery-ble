@@ -409,14 +409,7 @@ async def _run_gatttool(address: str, connect_timeout: float,
         except TimeoutError:
             LOG.warning("CCCD write response timed out")
 
-        # 5. Write trigger byte to FF00
-        send_cmd(
-            f"char-write-req 0x{FF00_VALUE_HANDLE:04x} 01")
-        try:
-            await read_until("successfully", timeout=5.0)
-            LOG.info("FF00 trigger written")
-        except TimeoutError:
-            LOG.warning("FF00 trigger write response timed out")
+        LOG.info("Waiting for indications (timeout=%.0fs)", frame_timeout)
 
         LOG.info("Waiting for indications (timeout=%.0fs)", frame_timeout)
         last_frame_ts = time.time()
