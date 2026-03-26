@@ -16,6 +16,8 @@ import paho.mqtt.client as mqtt
 # Constants
 # ---------------------------------------------------------------------------
 CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
+CCCD_INDICATE = b"\x02\x00"  # Enable indications (not notifications)
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
@@ -332,7 +334,27 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
             ) as client:
                 LOG.info("BLE connected")
 
-                # Subscribe then immediately enter streaming loop.
+                # Log FF01 characteristic properties for debugging.
+                char = client.services.get_characteristic(
+                    CHAR_FF01_UUID)
+                if char:
+                    LOG.info("FF01 properties: %s", char.properties)
+                else:
+                    LOG.warning("FF01 characteristic not found!")
+
+                # Manually write CCCD to enable indications (0x0002).
+                # bleak's start_notify may write 0x0001 (notify) instead
+                # of 0x0002 (indicate) on some BlueZ versions, causing
+                # the BMS to disconnect.
+                if char:
+                    for desc in char.descriptors:
+                        if CCCD_UUID in str(desc.uuid):
+                            LOG.info("Writing CCCD indicate to %s",
+                                     desc.uuid)
+                            await client.write_gatt_descriptor(
+                                desc.handle, CCCD_INDICATE)
+                            break
+
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
                 LOG.info("Subscribed to FF01; waiting for frames "
                          "(timeout=%.0fs)", frame_timeout)
