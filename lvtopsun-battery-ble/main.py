@@ -15,6 +15,7 @@ import paho.mqtt.client as mqtt
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+CHAR_FF00_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"  # Write char
 CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"  # Indicate char
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
@@ -368,8 +369,31 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                 else:
                     LOG.warning("FF01 characteristic not found!")
 
+                # Let BMS settle after connect (name changes
+                # to "ASR" ~0.5s after connect).
+                await asyncio.sleep(1.0)
+
+                # Read FF01 before subscribing — matches the
+                # macOS proxy sequence where the first operation
+                # is a read returning "C2 Value".
+                try:
+                    init_val = await client.read_gatt_char(
+                        CHAR_FF01_UUID)
+                    LOG.info("FF01 initial read: %d bytes: %s",
+                             len(init_val), init_val.hex(" "))
+                except Exception as e:
+                    LOG.warning("FF01 initial read failed: %s", e)
+
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
                 LOG.info("Subscribed to FF01 indications")
+
+                # Write trigger byte to FF00 after subscribe.
+                try:
+                    await client.write_gatt_char(
+                        CHAR_FF00_UUID, b"\x01")
+                    LOG.info("Wrote trigger to FF00")
+                except Exception as e:
+                    LOG.warning("FF00 trigger write failed: %s", e)
 
                 LOG.info("Waiting for frames (timeout=%.0fs)",
                          frame_timeout)
