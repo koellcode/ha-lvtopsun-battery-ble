@@ -21,6 +21,7 @@ import paho.mqtt.client as mqtt
 # ---------------------------------------------------------------------------
 CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
 CHAR_FF00_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"
+CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
@@ -242,6 +243,14 @@ def parse_hex_bytes(value: str):
     return bytes.fromhex(cleaned)
 
 
+def find_characteristic(services, uuid: str):
+    for service in services:
+        for characteristic in service.characteristics:
+            if str(characteristic.uuid).lower() == uuid.lower():
+                return characteristic
+    return None
+
+
 # ---------------------------------------------------------------------------
 # MQTT helpers
 # ---------------------------------------------------------------------------
@@ -385,6 +394,8 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     probe_interval = max(float(opts.get("probe_interval", 5)), 1.0)
     subscribe_settle_delay = max(float(opts.get("subscribe_settle_delay", 0.0)), 0.0)
     post_subscribe_delay = max(float(opts.get("post_subscribe_delay", 0.0)), 0.0)
+    inspect_ff01_descriptors = bool(opts.get("inspect_ff01_descriptors", True))
+    force_ff01_cccd_indicate = bool(opts.get("force_ff01_cccd_indicate", False))
     ff00_request_hex = (opts.get("ff00_request_hex") or "").strip()
     ff00_request_timing = (opts.get("ff00_request_timing") or "before-subscribe").strip().lower()
     ff00_request_response = bool(opts.get("ff00_request_response", False))
@@ -468,6 +479,75 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
             response=ff00_request_response,
         )
 
+    async def inspect_ff01_subscription_state(client):
+        ff01_char = find_characteristic(client.services, CHAR_FF01_UUID)
+        if ff01_char is None:
+            LOG.warning("FF01 characteristic not found after service discovery")
+            return None
+
+        props = ", ".join(ff01_char.properties)
+        LOG.info(
+            "FF01 characteristic handle=0x%04X props=(%s) descriptors=%d",
+            ff01_char.handle,
+            props,
+            len(ff01_char.descriptors),
+        )
+
+        cccd = None
+        if inspect_ff01_descriptors:
+            for descriptor in ff01_char.descriptors:
+                desc_uuid = str(descriptor.uuid).lower()
+                if desc_uuid == CCCD_UUID:
+                    cccd = descriptor
+                try:
+                    value = await client.read_gatt_descriptor(descriptor.handle)
+                    value_hex = value.hex(" ").upper()
+                except Exception as exc:
+                    value_hex = f"(read error: {exc})"
+                LOG.info(
+                    "FF01 descriptor uuid=%s handle=0x%04X value=%s",
+                    descriptor.uuid,
+                    descriptor.handle,
+                    value_hex,
+                )
+        else:
+            for descriptor in ff01_char.descriptors:
+                if str(descriptor.uuid).lower() == CCCD_UUID:
+                    cccd = descriptor
+                    break
+
+        return ff01_char, cccd
+
+    async def maybe_force_cccd_indicate(client, cccd):
+        if not force_ff01_cccd_indicate:
+            return
+        if cccd is None:
+            LOG.warning("FF01 CCCD not found; cannot force indication enable")
+            return
+
+        set_phase("force-cccd-indicate")
+        payload = b"\x02\x00"
+        LOG.info(
+            "Force-writing FF01 CCCD handle=0x%04X value=%s",
+            cccd.handle,
+            payload.hex(" ").upper(),
+        )
+        try:
+            await client.write_gatt_descriptor(cccd.handle, payload)
+            LOG.info("Forced FF01 CCCD write succeeded")
+        except Exception as exc:
+            LOG.warning("Forced FF01 CCCD write failed: %s", exc)
+            return
+
+        try:
+            value = await client.read_gatt_descriptor(cccd.handle)
+            LOG.info(
+                "FF01 CCCD after forced write: %s",
+                value.hex(" ").upper(),
+            )
+        except Exception as exc:
+            LOG.warning("Reading FF01 CCCD after forced write failed: %s", exc)
+
     async def start_notify_with_retry(client):
         attempts = 2
         last_error = None
@@ -548,6 +628,12 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                 # Subscribe to notifications/indications on FF01 after a short settle period.
                 set_phase("subscribe-ff01")
                 await start_notify_with_retry(client)
+                ff01_state = await inspect_ff01_subscription_state(client)
+                if ff01_state is not None:
+                    _ff01_char, ff01_cccd = ff01_state
+                    await maybe_force_cccd_indicate(client, ff01_cccd)
+                    if force_ff01_cccd_indicate and inspect_ff01_descriptors:
+                        await inspect_ff01_subscription_state(client)
 
                 try:
                     disconnected_event.clear()

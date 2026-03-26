@@ -21,6 +21,8 @@ Reads SOC (State of Charge) from a LVTOPSUN LiFePO4 battery via BLE and publishe
 | `probe_interval`          | `5`                    | Interval used while waiting for frame queue activity                 |
 | `subscribe_settle_delay`  | `0.0`                  | Optional delay before subscribing to `FF01`                          |
 | `post_subscribe_delay`    | `0.0`                  | Optional delay after subscribing before entering stream loop         |
+| `inspect_ff01_descriptors`| `true`                 | Read and log `FF01` descriptor handles and values after subscribe    |
+| `force_ff01_cccd_indicate`| `false`                | Opt-in debug: explicitly write `0x02 0x00` to the `FF01` CCCD        |
 | `ff00_request_hex`        | _(empty)_              | Optional hex payload to write to `FF00` as a telemetry request       |
 | `ff00_request_timing`     | `before-subscribe`     | When to send `ff00_request_hex`: before or after `FF01` subscribe    |
 | `ff00_request_response`   | `false`                | Whether the `FF00` write should request a write response             |
@@ -37,6 +39,8 @@ The add-on now reliably reaches BLE subscribe and can hold a stream session for 
 
 The add-on includes BlueZ state tracing and an optional `FF00` request hook because this battery may require a proprietary request packet before it starts sending telemetry on Linux.
 
+It also includes `FF01` descriptor diagnostics so you can verify whether BlueZ leaves the Client Characteristic Configuration Descriptor (`0x2902`) in the expected indication-enabled state.
+
 ## Testing An `FF00` Request
 
 1. Capture the phone app's first write to characteristic `0000ff00-0000-1000-8000-00805f9b34fb`.
@@ -44,6 +48,19 @@ The add-on includes BlueZ state tracing and an optional `FF00` request hook beca
 3. Start with `ff00_request_timing: before-subscribe`.
 4. Start with `ff00_request_response: false`.
 5. If the session still disconnects before frames arrive, retry with `ff00_request_timing: after-subscribe`.
+
+## Testing `FF01` CCCD Behavior
+
+1. Leave `inspect_ff01_descriptors: true` to log the `FF01` characteristic handle, properties, and descriptor values after subscribe.
+2. If Linux still subscribes successfully but receives `notifications=0`, enable `force_ff01_cccd_indicate: true` for one test run.
+3. Check whether the log shows the `0x2902` descriptor and whether forcing `02 00` changes the behavior.
+
+Example debug config:
+
+```yaml
+inspect_ff01_descriptors: true
+force_ff01_cccd_indicate: true
+```
 
 Example:
 
