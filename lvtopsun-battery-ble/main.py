@@ -9,6 +9,8 @@ import sys
 import time
 
 import re
+import socket
+import struct
 
 from bleak import BleakScanner
 import paho.mqtt.client as mqtt
@@ -312,56 +314,73 @@ async def _run_gatttool(address: str, connect_timeout: float,
                        frame_timeout: float, assembler, frame_queue,
                        publish_interval, mqttc, topic_base,
                        last_soc, last_pub_ts):
-    """Run gatttool in non-interactive mode with --listen.
+    """Run gatttool interactive mode with stdbuf for line-buffered output.
 
-    Uses gatttool's built-in --char-write-req + --listen mode which
-    properly registers the GAttrib event handler and handles ATT
-    indication confirmations.
-
-    Command: gatttool -b <addr> -m 200 --char-write-req -a 0x0028 -n 0200 --listen
+    Interactive mode is needed for ATT MTU exchange (the 'mtu' command).
+    stdbuf -oL forces line-buffered stdout so indication events flush
+    through pipes instead of getting stuck in stdio's full buffer.
     """
     proc = await asyncio.create_subprocess_exec(
-        "gatttool", "-b", address, "-m", "200",
-        "--char-write-req", "-a",
-        f"0x{FF01_CCCD_HANDLE:04x}", "-n", "0200",
-        "--listen",
+        "stdbuf", "-oL",
+        "gatttool", "-b", address, "-I", "-m", "200",
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
     last_frame_ts = time.time()
 
     try:
-        # Wait for the write confirmation (means connect + CCCD write succeeded)
-        deadline = time.time() + connect_timeout
-        connected = False
-        while time.time() < deadline:
-            try:
-                line = await asyncio.wait_for(
-                    proc.stdout.readline(),
-                    timeout=max(deadline - time.time(), 0.1),
-                )
-            except asyncio.TimeoutError:
-                continue
-            if not line:
-                raise ConnectionError("gatttool exited before connecting")
-            text = line.decode(errors="replace").strip()
-            if text:
-                LOG.info("gatttool< %s", text)
-            if "successfully" in text:
-                connected = True
-                LOG.info("gatttool: connected and CCCD written to %s",
-                         address)
-                break
-            if "error" in text.lower() or "fail" in text.lower():
-                raise ConnectionError(f"gatttool: {text}")
+        async def send_cmd(cmd: str):
+            LOG.debug("gatttool> %s", cmd)
+            proc.stdin.write((cmd + "\n").encode())
+            await proc.stdin.drain()
 
-        if not connected:
-            raise TimeoutError("gatttool connect/write timed out")
+        async def read_until(pattern: str, timeout: float = 10.0):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(),
+                        timeout=max(deadline - time.time(), 0.1),
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                if not line:
+                    raise ConnectionError("gatttool process exited")
+                text = line.decode(errors="replace").strip()
+                if text:
+                    LOG.debug("gatttool< %s", text)
+                if pattern in text:
+                    return text
+            raise TimeoutError(f"Timed out waiting for '{pattern}'")
+
+        # 1. Connect
+        await send_cmd("connect")
+        await read_until("Connection successful", timeout=connect_timeout)
+        LOG.info("gatttool: connected to %s", address)
+
+        # 2. Settle + MTU exchange
+        await asyncio.sleep(1.0)
+        await send_cmd("mtu 200")
+        try:
+            resp = await read_until("MTU", timeout=5.0)
+            LOG.info("MTU: %s", resp.strip())
+        except TimeoutError:
+            LOG.warning("MTU exchange: no response")
+
+        # 3. Write CCCD to enable indications
+        await send_cmd(
+            f"char-write-req 0x{FF01_CCCD_HANDLE:04x} 0200")
+        try:
+            await read_until("successfully", timeout=5.0)
+            LOG.info("CCCD indication enable written")
+        except TimeoutError:
+            LOG.warning("CCCD write response timed out")
 
         LOG.info("Waiting for indications (timeout=%.0fs)", frame_timeout)
         last_frame_ts = time.time()
 
-        # Stream loop — read stdout for indication lines
+        # 4. Stream loop
         while True:
             try:
                 line = await asyncio.wait_for(
@@ -412,6 +431,11 @@ async def _run_gatttool(address: str, connect_timeout: float,
                 LOG.info("gatttool< %s", text)
 
     finally:
+        try:
+            proc.stdin.write(b"disconnect\n")
+            await proc.stdin.drain()
+        except Exception:
+            pass
         try:
             proc.terminate()
             await asyncio.wait_for(proc.wait(), timeout=3.0)

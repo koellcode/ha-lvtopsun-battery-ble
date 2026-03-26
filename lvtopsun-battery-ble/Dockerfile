@@ -4,6 +4,7 @@ FROM ${BUILD_FROM}
 RUN apk add --no-cache \
         bluez \
         bluez-deprecated \
+        coreutils \
         dbus \
         glib \
         python3 \
