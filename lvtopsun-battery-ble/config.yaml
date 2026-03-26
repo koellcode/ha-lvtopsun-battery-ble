@@ -1,0 +1,34 @@
+name: "LVTOPSUN Battery BLE"
+description: "Reads SOC from LVTOPSUN LiFePO4 battery via BLE and publishes to MQTT"
+version: "0.1.0"
+slug: lvtopsun-battery-ble
+url: "https://github.com/thomaskoelling/lvtopsun-battery-ble"
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+host_dbus: true
+host_network: true
+options:
+  device_name: "LLM_UNAZAY_0008FR"
+  scan_timeout: 10
+  connect_timeout: 15
+  poll_interval: 30
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_topic: "lvtopsun_battery"
+  log_level: "info"
+schema:
+  device_name: str
+  scan_timeout: int
+  connect_timeout: int
+  poll_interval: int
+  mqtt_host: str?
+  mqtt_port: int
+  mqtt_username: str?
+  mqtt_password: str?
+  mqtt_topic: str
+  log_level: list(debug|info|warning|error)
