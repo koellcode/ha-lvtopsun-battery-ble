@@ -551,9 +551,6 @@ async def run():
         stream=sys.stdout,
     )
 
-    # Enable debug for bleak (scanning) and gatttool output.
-    logging.getLogger("bleak").setLevel(logging.DEBUG)
-
     LOG.info("Starting LVTOPSUN Battery BLE add-on")
     LOG.info("Device: %s  Poll: %ds  Frame timeout: %ds",
              opts["device_name"], opts["poll_interval"],
