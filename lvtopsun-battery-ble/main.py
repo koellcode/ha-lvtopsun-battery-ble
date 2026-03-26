@@ -15,7 +15,8 @@ import paho.mqtt.client as mqtt
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+CHAR_FF00_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"  # Write char
+CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"  # Indicate char
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
@@ -290,20 +291,17 @@ async def clear_bluez_cache(address: str):
 
 
 async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
-    """Connect, subscribe FF01 indications, stream frames, publish SOC.
+    """Scan, connect, subscribe FF01, stream frames, publish SOC.
 
-    The BMS auto-streams telemetry after indication subscription.
-    Critical: NO extra GATT reads/writes between start_notify and the
-    streaming loop — additional ATT traffic causes the BMS to disconnect.
+    Each attempt does: clear cache → scan → connect → subscribe → stream.
+    After subscribing, writes a trigger byte to FF00 to kick the BMS
+    into sending telemetry (some BMS firmware requires this on BlueZ).
     """
-    device = await find_device(opts["device_name"], opts["scan_timeout"])
-    if device is None:
-        LOG.warning("Device '%s' not found", opts["device_name"])
-        return last_soc, last_pub_ts
-
     frame_timeout = max(float(opts.get("frame_timeout", 120)), 5.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
+    device_name = opts["device_name"]
+    scan_timeout = opts["scan_timeout"]
 
     disconnected_event = asyncio.Event()
     frame_queue: asyncio.Queue = asyncio.Queue()
@@ -334,16 +332,27 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
         disconnected_event.set()
 
     last_exc = None
+    last_address = None
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
+            # Clear BlueZ cache before scanning (if we know the address).
+            if last_address:
+                await clear_bluez_cache(last_address)
+
+            # Fresh scan each attempt so BlueZ re-discovers the device.
+            device = await find_device(device_name, scan_timeout)
+            if device is None:
+                LOG.warning("Device '%s' not found (attempt %d/%d)",
+                            device_name, attempt, max_attempts)
+                if attempt < max_attempts:
+                    await asyncio.sleep(2)
+                continue
+            last_address = device.address
+
             LOG.info("BLE connect attempt %d/%d to %s",
                      attempt, max_attempts, device.address)
             disconnected_event.clear()
-
-            # Clear BlueZ GATT cache to force fresh service discovery.
-            await clear_bluez_cache(device.address)
-            await asyncio.sleep(1.0)
 
             async with BleakClient(
                 device,
@@ -360,16 +369,23 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                 else:
                     LOG.warning("FF01 characteristic not found!")
 
-                # Brief settle after connect — give BlueZ time to
-                # stabilize the connection before subscribing.
-                await asyncio.sleep(1.0)
-
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
-                LOG.info("Subscribed to FF01; waiting for frames "
-                         "(timeout=%.0fs)", frame_timeout)
+                LOG.info("Subscribed to FF01 indications")
 
-                # Clear disconnect flag right before streaming — BlueZ may
-                # fire disconnect during connect/service-discovery phase.
+                # Write trigger to FF00 to kick BMS into streaming.
+                try:
+                    await client.write_gatt_char(
+                        CHAR_FF00_UUID, b"\x01", response=False)
+                    LOG.info("Wrote trigger to FF00")
+                except Exception as exc:
+                    LOG.debug("FF00 trigger write failed (non-fatal): %s",
+                              exc)
+
+                LOG.info("Waiting for frames (timeout=%.0fs)",
+                         frame_timeout)
+
+                # Clear disconnect flag right before streaming — BlueZ
+                # may fire disconnect during connect/service-discovery.
                 disconnected_event.clear()
                 last_frame_ts = time.time()
 
