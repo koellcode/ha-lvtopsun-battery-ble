@@ -368,6 +368,11 @@ async def read_once(opts):
                     LOG.debug("Initial FF01 read failed (non-fatal): %s", exc)
 
                 try:
+                    # Clear disconnect flag right before waiting — BlueZ may
+                    # fire the callback during the connect/service-discovery
+                    # phase, which would otherwise cause an instant bail-out.
+                    disconnected_event.clear()
+
                     LOG.info("Waiting up to %.1fs for BMS frame", frame_timeout)
 
                     # Wait for either a frame or unexpected disconnect
@@ -486,7 +491,7 @@ async def run():
                     opts["poll_interval"] * (2 ** consecutive_failures),
                     max_backoff,
                 )
-            LOG.debug("Sleeping %ds before next poll", delay)
+            LOG.info("Next poll in %ds", delay)
             await asyncio.sleep(delay)
     except asyncio.CancelledError:
         pass
