@@ -15,7 +15,6 @@ import paho.mqtt.client as mqtt
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CHAR_FF00_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"  # Write char
 CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"  # Indicate char
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
@@ -372,15 +371,6 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
                 LOG.info("Subscribed to FF01 indications")
 
-                # Write trigger to FF00 to kick BMS into streaming.
-                try:
-                    await client.write_gatt_char(
-                        CHAR_FF00_UUID, b"\x01", response=False)
-                    LOG.info("Wrote trigger to FF00")
-                except Exception as exc:
-                    LOG.debug("FF00 trigger write failed (non-fatal): %s",
-                              exc)
-
                 LOG.info("Waiting for frames (timeout=%.0fs)",
                          frame_timeout)
 
@@ -390,6 +380,7 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                 last_frame_ts = time.time()
 
                 try:
+                    diag_done = False
                     while (client.is_connected
                            and not disconnected_event.is_set()):
                         try:
@@ -406,6 +397,21 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                                 last_pub_ts = rx_ts
                         except asyncio.TimeoutError:
                             idle = time.time() - last_frame_ts
+                            # Diagnostic: if no indication after 10s,
+                            # try a manual read of FF01.
+                            if idle >= 10 and not diag_done:
+                                diag_done = True
+                                try:
+                                    val = await client.read_gatt_char(
+                                        CHAR_FF01_UUID)
+                                    LOG.info(
+                                        "Diagnostic FF01 read: %d "
+                                        "bytes: %s",
+                                        len(val), val.hex(" "))
+                                except Exception as e:
+                                    LOG.warning(
+                                        "Diagnostic FF01 read "
+                                        "failed: %s", e)
                             if idle >= frame_timeout:
                                 LOG.warning("No frame for %.0fs; "
                                             "reconnecting", idle)
@@ -445,6 +451,9 @@ async def run():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
+
+    # Always enable debug for bleak to trace BLE subscription issues.
+    logging.getLogger("bleak").setLevel(logging.DEBUG)
 
     LOG.info("Starting LVTOPSUN Battery BLE add-on")
     LOG.info("Device: %s  Poll: %ds  Frame timeout: %ds",
