@@ -326,23 +326,31 @@ def process_candidate_frame(data: bytes, result: dict, got_frame: asyncio.Event,
     got_frame.set()
 
 
-async def read_once(opts):
-    """Connect, subscribe, wait for one complete frame, return SOC or None."""
+async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts):
+    """Keep a BLE session alive and publish SOC whenever frames arrive."""
     device = await find_device(opts["device_name"], opts["scan_timeout"])
     if device is None:
         LOG.warning("Device '%s' not found", opts["device_name"])
-        return None
+        return last_soc, last_publish_ts
 
-    result = {}
-    got_frame = asyncio.Event()
     frame_timeout = max(float(opts.get("frame_timeout", 120)), 5.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
+    publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
 
     disconnected_event = asyncio.Event()
+    frame_queue = asyncio.Queue()
 
     def on_frame(frame: bytes):
-        LOG.debug("Complete frame received: %d bytes, header=%s", len(frame), frame[:4].hex())
-        process_candidate_frame(frame, result, got_frame, "notify")
+        soc = decode_soc(frame)
+        if soc is None:
+            LOG.debug("Ignoring notify payload (%d bytes): not a decodable telemetry frame", len(frame))
+            return
+        voltage = decode_pack_voltage(frame)
+        if voltage is None:
+            LOG.info("Decoded SOC=%d%% from notify payload", soc)
+        else:
+            LOG.info("Decoded SOC=%d%%, pack_voltage=%.2fV from notify payload", soc, voltage)
+        frame_queue.put_nowait((soc, voltage, time.time()))
 
     assembler = FrameAssembler(on_frame=on_frame)
 
@@ -350,7 +358,7 @@ async def read_once(opts):
         LOG.debug("BLE notification/indication: %d bytes", len(data))
         assembler.feed(bytes(data))
 
-    def on_disconnect(client):
+    def on_disconnect(_client):
         LOG.warning("BLE device disconnected unexpectedly")
         disconnected_event.set()
 
@@ -382,49 +390,31 @@ async def read_once(opts):
                 # Subscribe to notifications/indications on FF01 immediately
                 LOG.info("Subscribing to FF01 indications...")
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
-                await _enable_indications_manually(client, CHAR_FF01_UUID)
 
                 try:
-                    # Clear disconnect flag right before waiting — BlueZ may
-                    # fire the callback during the connect/service-discovery
-                    # phase, which would otherwise cause an instant bail-out.
                     disconnected_event.clear()
+                    LOG.info("Streaming BMS frames; idle timeout %.1fs", frame_timeout)
 
-                    LOG.info("Waiting up to %.1fs for BMS frame", frame_timeout)
-
-                    # Wait for either a frame or unexpected disconnect
-                    done_tasks = set()
-                    frame_wait = asyncio.ensure_future(got_frame.wait())
-                    disc_wait = asyncio.ensure_future(disconnected_event.wait())
-                    try:
-                        done_tasks, pending = await asyncio.wait(
-                            {frame_wait, disc_wait},
-                            timeout=frame_timeout,
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                    finally:
-                        frame_wait.cancel()
-                        disc_wait.cancel()
-
-                    if got_frame.is_set():
-                        LOG.info("Got frame successfully")
-                    elif disconnected_event.is_set():
-                        LOG.warning("Device disconnected while waiting for frame")
-                    else:
-                        # Timeout — try a direct read as fallback
-                        LOG.warning(
-                            "No frame after %.1fs, trying fallback FF01 read",
-                            frame_timeout,
-                        )
+                    while client.is_connected and not disconnected_event.is_set():
                         try:
-                            value = await client.read_gatt_char(CHAR_FF01_UUID)
-                            LOG.debug("Fallback FF01 read returned %d bytes", len(value))
-                            process_candidate_frame(bytes(value), result, got_frame, "fallback-read")
-                        except Exception as exc:
-                            LOG.debug("Fallback FF01 read failed: %s", exc)
+                            soc, _voltage, received_at = await asyncio.wait_for(
+                                frame_queue.get(),
+                                timeout=frame_timeout,
+                            )
+                            if soc != last_soc or (received_at - last_publish_ts) >= publish_interval:
+                                publish_state(mqttc, topic_base, soc)
+                                last_soc = soc
+                                last_publish_ts = received_at
+                            else:
+                                LOG.debug("Skipping unchanged SOC=%d%%", soc)
+                        except asyncio.TimeoutError:
+                            LOG.warning(
+                                "No BMS frame received for %.1fs; keeping connection open",
+                                frame_timeout,
+                            )
 
-                    if not got_frame.is_set():
-                        LOG.warning("Timed out waiting for BMS frame")
+                    if disconnected_event.is_set():
+                        LOG.info("BLE session ended after disconnect")
                 finally:
                     try:
                         if client.is_connected:
@@ -433,13 +423,6 @@ async def read_once(opts):
                         LOG.debug("Ignoring stop_notify cleanup failure: %s", exc)
 
             last_exc = None
-            if got_frame.is_set():
-                break  # Success — no need to retry
-            # If we connected but got no frame, still retry
-            if connect_attempt < max_attempts:
-                LOG.info("Connected but no frame — retrying after 2s")
-                await asyncio.sleep(2)
-                continue
             break
 
         except Exception as exc:
@@ -450,7 +433,7 @@ async def read_once(opts):
 
     if last_exc is not None:
         LOG.error("BLE error: %s", last_exc)
-        return None
+    return last_soc, last_publish_ts
 
     return result.get("soc")
 
@@ -483,22 +466,20 @@ async def run():
     publish_availability(mqttc, topic_base, True)
 
     retry_delay = max(int(opts.get("retry_delay", 10)), 1)
+    last_soc = None
+    last_publish_ts = 0.0
 
     try:
         while True:
-            soc = await read_once(opts)
-            if soc is not None:
-                publish_state(mqttc, topic_base, soc)
-                delay = opts["poll_interval"]
-            else:
-                LOG.warning(
-                    "Read failed. Retaining last published SOC and retrying in %ds.",
-                    retry_delay,
-                )
-                delay = retry_delay
-
-            LOG.info("Next poll in %ds", delay)
-            await asyncio.sleep(delay)
+            last_soc, last_publish_ts = await connect_and_stream(
+                opts,
+                mqttc,
+                topic_base,
+                last_soc,
+                last_publish_ts,
+            )
+            LOG.info("Reconnecting in %ds", retry_delay)
+            await asyncio.sleep(retry_delay)
     except asyncio.CancelledError:
         pass
     finally:
