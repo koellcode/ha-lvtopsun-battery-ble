@@ -17,10 +17,6 @@ import paho.mqtt.client as mqtt
 # Constants
 # ---------------------------------------------------------------------------
 CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
-# CCCD descriptor UUID (standard BLE)
-CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
-# CCCD value to enable indications (little-endian 0x0002)
-CCCD_INDICATE_ENABLE = b"\x02\x00"
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
@@ -43,6 +39,7 @@ def load_options():
         "frame_timeout": int(os.environ.get("FRAME_TIMEOUT", "120")),
         "poll_interval": int(os.environ.get("POLL_INTERVAL", "30")),
         "retry_delay": int(os.environ.get("RETRY_DELAY", "10")),
+        "probe_interval": int(os.environ.get("PROBE_INTERVAL", "5")),
         "mqtt_host": os.environ.get("MQTT_HOST", ""),
         "mqtt_port": int(os.environ.get("MQTT_PORT", "1883")),
         "mqtt_username": os.environ.get("MQTT_USERNAME", ""),
@@ -286,46 +283,6 @@ async def find_device(name: str, timeout: float):
     return None
 
 
-async def _enable_indications_manually(client, char_uuid):
-    """Manually write the CCCD descriptor to enable indications.
-
-    BlueZ sometimes doesn't correctly enable indications via start_notify().
-    This writes 0x0002 (indicate enable) to the CCCD descriptor directly.
-    """
-    for svc in client.services:
-        for char in svc.characteristics:
-            if char.uuid == char_uuid:
-                for desc in char.descriptors:
-                    if desc.uuid == CCCD_UUID:
-                        LOG.debug(
-                            "Writing CCCD indication enable (0x0002) to descriptor handle 0x%04X",
-                            desc.handle,
-                        )
-                        try:
-                            await client.write_gatt_descriptor(desc.handle, CCCD_INDICATE_ENABLE)
-                            LOG.debug("CCCD indication enable written successfully")
-                            return True
-                        except Exception as exc:
-                            LOG.warning("CCCD write failed: %s", exc)
-                            return False
-    LOG.debug("CCCD descriptor not found for %s", char_uuid)
-    return False
-
-
-def process_candidate_frame(data: bytes, result: dict, got_frame: asyncio.Event, source: str):
-    soc = decode_soc(data)
-    if soc is None:
-        LOG.debug("Ignoring %s payload (%d bytes): not a decodable telemetry frame", source, len(data))
-        return
-    result["soc"] = soc
-    voltage = decode_pack_voltage(data)
-    if voltage is None:
-        LOG.info("Decoded SOC=%d%% from %s payload", soc, source)
-    else:
-        LOG.info("Decoded SOC=%d%%, pack_voltage=%.2fV from %s payload", soc, voltage, source)
-    got_frame.set()
-
-
 async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts):
     """Keep a BLE session alive and publish SOC whenever frames arrive."""
     device = await find_device(opts["device_name"], opts["scan_timeout"])
@@ -336,11 +293,14 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     frame_timeout = max(float(opts.get("frame_timeout", 120)), 5.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
+    probe_interval = max(float(opts.get("probe_interval", 5)), 1.0)
 
     disconnected_event = asyncio.Event()
     frame_queue = asyncio.Queue()
+    last_frame_ts = time.time()
 
     def on_frame(frame: bytes):
+        nonlocal last_frame_ts
         soc = decode_soc(frame)
         if soc is None:
             LOG.debug("Ignoring notify payload (%d bytes): not a decodable telemetry frame", len(frame))
@@ -350,6 +310,7 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
             LOG.info("Decoded SOC=%d%% from notify payload", soc)
         else:
             LOG.info("Decoded SOC=%d%%, pack_voltage=%.2fV from notify payload", soc, voltage)
+        last_frame_ts = time.time()
         frame_queue.put_nowait((soc, voltage, time.time()))
 
     assembler = FrameAssembler(on_frame=on_frame)
@@ -393,13 +354,26 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
 
                 try:
                     disconnected_event.clear()
-                    LOG.info("Streaming BMS frames; idle timeout %.1fs", frame_timeout)
+                    last_frame_ts = time.time()
+                    LOG.info(
+                        "Streaming BMS frames; idle timeout %.1fs; probe interval %.1fs",
+                        frame_timeout,
+                        probe_interval,
+                    )
+
+                    try:
+                        value = await client.read_gatt_char(CHAR_FF01_UUID)
+                        LOG.debug("Initial FF01 primer read returned %d bytes", len(value))
+                        if value:
+                            assembler.feed(bytes(value))
+                    except Exception as exc:
+                        LOG.debug("Initial FF01 primer read failed: %s", exc)
 
                     while client.is_connected and not disconnected_event.is_set():
                         try:
                             soc, _voltage, received_at = await asyncio.wait_for(
                                 frame_queue.get(),
-                                timeout=frame_timeout,
+                                timeout=probe_interval,
                             )
                             if soc != last_soc or (received_at - last_publish_ts) >= publish_interval:
                                 publish_state(mqttc, topic_base, soc)
@@ -408,10 +382,20 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                             else:
                                 LOG.debug("Skipping unchanged SOC=%d%%", soc)
                         except asyncio.TimeoutError:
-                            LOG.warning(
-                                "No BMS frame received for %.1fs; keeping connection open",
-                                frame_timeout,
-                            )
+                            idle_for = time.time() - last_frame_ts
+                            if idle_for >= frame_timeout:
+                                LOG.warning(
+                                    "No BMS frame received for %.1fs; reconnecting session",
+                                    idle_for,
+                                )
+                                break
+                            try:
+                                value = await client.read_gatt_char(CHAR_FF01_UUID)
+                                LOG.debug("FF01 keepalive read returned %d bytes", len(value))
+                                if value:
+                                    assembler.feed(bytes(value))
+                            except Exception as exc:
+                                LOG.debug("FF01 keepalive read failed: %s", exc)
 
                     if disconnected_event.is_set():
                         LOG.info("BLE session ended after disconnect")
@@ -434,8 +418,6 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     if last_exc is not None:
         LOG.error("BLE error: %s", last_exc)
     return last_soc, last_publish_ts
-
-    return result.get("soc")
 
 
 # ---------------------------------------------------------------------------
