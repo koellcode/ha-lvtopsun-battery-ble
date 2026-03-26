@@ -462,21 +462,10 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                     last_frame_ts = time.time()
                     set_phase("streaming")
                     LOG.info(
-                        "Streaming BMS frames; idle timeout %.1fs; probe interval %.1fs",
+                        "Streaming BMS frames; idle timeout %.1fs; check interval %.1fs",
                         frame_timeout,
                         probe_interval,
                     )
-
-                    try:
-                        set_phase("primer-read")
-                        value = await client.read_gatt_char(CHAR_FF01_UUID)
-                        LOG.debug("Initial FF01 primer read returned %d bytes", len(value))
-                        if value:
-                            assembler.feed(bytes(value))
-                    except Exception as exc:
-                        LOG.debug("Initial FF01 primer read failed: %s", exc)
-                    finally:
-                        set_phase("streaming")
 
                     while client.is_connected and not disconnected_event.is_set():
                         try:
@@ -499,17 +488,6 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                                 )
                                 set_phase("idle-timeout")
                                 break
-                            try:
-                                set_phase("keepalive-read")
-                                value = await client.read_gatt_char(CHAR_FF01_UUID)
-                                LOG.debug("FF01 keepalive read returned %d bytes", len(value))
-                                if value:
-                                    assembler.feed(bytes(value))
-                            except Exception as exc:
-                                LOG.debug("FF01 keepalive read failed: %s", exc)
-                            finally:
-                                if client.is_connected and not disconnected_event.is_set():
-                                    set_phase("streaming")
 
                     if disconnected_event.is_set():
                         LOG.info("BLE session ended after disconnect")
