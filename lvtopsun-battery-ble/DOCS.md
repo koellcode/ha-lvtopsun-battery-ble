@@ -10,18 +10,48 @@ Reads SOC (State of Charge) from a LVTOPSUN LiFePO4 battery via BLE and publishe
 
 ## Configuration
 
-| Option            | Default             | Description                                                          |
-| ----------------- | ------------------- | -------------------------------------------------------------------- |
-| `device_name`     | `LLM_UNAZAY_0008FR` | BLE device name (or substring) to search for                         |
-| `scan_timeout`    | `10`                | BLE scan timeout in seconds                                          |
-| `connect_timeout` | `15`                | BLE connection timeout in seconds                                    |
-| `poll_interval`   | `30`                | Seconds between SOC reads                                            |
-| `mqtt_host`       | _(auto)_            | MQTT broker host. Leave empty to auto-discover from Mosquitto add-on |
-| `mqtt_port`       | `1883`              | MQTT broker port                                                     |
-| `mqtt_username`   | _(auto)_            | MQTT username                                                        |
-| `mqtt_password`   | _(auto)_            | MQTT password                                                        |
-| `mqtt_topic`      | `lvtopsun_battery`  | MQTT topic prefix                                                    |
-| `log_level`       | `info`              | Log level: debug, info, warning, error                               |
+| Option                    | Default                | Description                                                          |
+| ------------------------- | ---------------------- | -------------------------------------------------------------------- |
+| `device_name`             | `LLM_UNAZAY_0008FR`    | BLE device name (or substring) to search for                         |
+| `scan_timeout`            | `10`                   | BLE scan timeout in seconds                                          |
+| `connect_timeout`         | `30`                   | BLE connection timeout in seconds                                    |
+| `frame_timeout`           | `120`                  | Maximum time to wait for a telemetry frame before reconnecting       |
+| `poll_interval`           | `30`                   | Minimum interval between MQTT publishes for unchanged SOC            |
+| `retry_delay`             | `10`                   | Delay before opening a new BLE session after disconnect              |
+| `probe_interval`          | `5`                    | Interval used while waiting for frame queue activity                 |
+| `subscribe_settle_delay`  | `0.0`                  | Optional delay before subscribing to `FF01`                          |
+| `post_subscribe_delay`    | `0.0`                  | Optional delay after subscribing before entering stream loop         |
+| `ff00_request_hex`        | _(empty)_              | Optional hex payload to write to `FF00` as a telemetry request       |
+| `ff00_request_timing`     | `before-subscribe`     | When to send `ff00_request_hex`: before or after `FF01` subscribe    |
+| `ff00_request_response`   | `false`                | Whether the `FF00` write should request a write response             |
+| `mqtt_host`               | _(auto)_               | MQTT broker host. Leave empty to auto-discover from Mosquitto add-on |
+| `mqtt_port`               | `1883`                 | MQTT broker port                                                     |
+| `mqtt_username`           | _(auto)_               | MQTT username                                                        |
+| `mqtt_password`           | _(auto)_               | MQTT password                                                        |
+| `mqtt_topic`              | `lvtopsun_battery`     | MQTT topic prefix                                                    |
+| `log_level`               | `info`                 | Log level: debug, info, warning, error                               |
+
+## Current Linux Status
+
+The add-on now reliably reaches BLE subscribe and can hold a stream session for several seconds on Home Assistant OS / BlueZ. The remaining blocker is that some sessions disconnect before the first telemetry frame arrives.
+
+The add-on includes BlueZ state tracing and an optional `FF00` request hook because this battery may require a proprietary request packet before it starts sending telemetry on Linux.
+
+## Testing An `FF00` Request
+
+1. Capture the phone app's first write to characteristic `0000ff00-0000-1000-8000-00805f9b34fb`.
+2. Set `ff00_request_hex` to that payload in the add-on config.
+3. Start with `ff00_request_timing: before-subscribe`.
+4. Start with `ff00_request_response: false`.
+5. If the session still disconnects before frames arrive, retry with `ff00_request_timing: after-subscribe`.
+
+Example:
+
+```yaml
+ff00_request_hex: "55AA01020304"
+ff00_request_timing: "before-subscribe"
+ff00_request_response: false
+```
 
 ## MQTT Topics
 
