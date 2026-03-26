@@ -374,13 +374,21 @@ async def _run_gatttool(address: str, connect_timeout: float,
         last_activity = time.time()
 
         # 4. Stream loop
+        # After first data arrives, use a short drain timeout (10s) so we
+        # disconnect quickly instead of waiting the full frame_timeout.
+        # The BMS sends one burst of data per connection, then goes silent.
         while True:
+            timeout = 10.0 if got_data else 5.0
             try:
                 line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=5.0,
+                    proc.stdout.readline(), timeout=timeout,
                 )
             except asyncio.TimeoutError:
                 idle = time.time() - last_activity
+                if got_data:
+                    LOG.info("No more data for %.0fs after frame; done",
+                             idle)
+                    break
                 if idle >= frame_timeout:
                     LOG.warning("No indication for %.0fs; reconnecting",
                                 idle)
