@@ -35,6 +35,7 @@ def load_options():
         "device_name": os.environ.get("DEVICE_NAME", "LLM_UNAZAY_0008FR"),
         "scan_timeout": int(os.environ.get("SCAN_TIMEOUT", "10")),
         "connect_timeout": int(os.environ.get("CONNECT_TIMEOUT", "15")),
+        "frame_timeout": int(os.environ.get("FRAME_TIMEOUT", "45")),
         "poll_interval": int(os.environ.get("POLL_INTERVAL", "30")),
         "mqtt_host": os.environ.get("MQTT_HOST", ""),
         "mqtt_port": int(os.environ.get("MQTT_PORT", "1883")),
@@ -266,6 +267,7 @@ async def read_once(opts):
 
     result = {}
     got_frame = asyncio.Event()
+    frame_timeout = max(float(opts.get("frame_timeout", 45)), 5.0)
 
     def on_frame(frame: bytes):
         process_candidate_frame(frame, result, got_frame, "notify")
@@ -285,7 +287,13 @@ async def read_once(opts):
             # Some batteries do not auto-stream immediately on Linux/BlueZ.
             # Probe FF01 directly while subscribed to trigger or retrieve data.
             try:
-                for attempt in range(1, 4):
+                deadline = asyncio.get_running_loop().time() + frame_timeout
+                attempt = 0
+                while not got_frame.is_set():
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    attempt += 1
                     if got_frame.is_set():
                         break
                     try:
@@ -299,12 +307,15 @@ async def read_once(opts):
                         break
 
                     try:
-                        await asyncio.wait_for(got_frame.wait(), timeout=10.0)
+                        await asyncio.wait_for(got_frame.wait(), timeout=min(15.0, remaining))
                     except asyncio.TimeoutError:
                         LOG.debug("No notify frame received after FF01 read attempt %d", attempt)
 
                 if not got_frame.is_set():
-                    LOG.warning("Timed out waiting for BMS frame after notify + direct reads")
+                    LOG.warning(
+                        "Timed out waiting %.1fs for BMS frame after notify + direct reads",
+                        frame_timeout,
+                    )
             finally:
                 try:
                     if client.is_connected:
@@ -333,7 +344,12 @@ async def run():
     )
 
     LOG.info("Starting LVTOPSUN Battery BLE add-on")
-    LOG.info("Device: %s  Poll interval: %ds", opts["device_name"], opts["poll_interval"])
+    LOG.info(
+        "Device: %s  Poll interval: %ds  Frame timeout: %ss",
+        opts["device_name"],
+        opts["poll_interval"],
+        opts.get("frame_timeout", 45),
+    )
 
     topic_base = opts.get("mqtt_topic", "lvtopsun_battery")
     mqttc = build_mqtt_client(opts)
