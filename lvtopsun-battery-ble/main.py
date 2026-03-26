@@ -20,7 +20,6 @@ FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
 # gatttool handles (from GATT service discovery)
-FF01_VALUE_HANDLE = 0x0027   # FF01 characteristic value
 FF01_CCCD_HANDLE  = 0x0028   # FF01 Client Characteristic Config
 
 # Regex to parse gatttool indication/notification output
@@ -370,38 +369,21 @@ async def _run_gatttool(address: str, connect_timeout: float,
         except TimeoutError:
             LOG.warning("CCCD write response timed out")
 
-        # 3b. Read FF01 as trigger (macOS does this and always gets data)
-        await send_cmd(f"char-read-hnd 0x{FF01_VALUE_HANDLE:04x}")
-        try:
-            resp = await read_until("Characteristic value", timeout=5.0)
-            LOG.info("FF01 read: %s", resp.strip())
-        except TimeoutError:
-            LOG.warning("FF01 read timed out (non-fatal)")
-
         LOG.info("Waiting for indications (timeout=%.0fs)...", frame_timeout)
         last_activity = time.time()
-        last_trigger = time.time()
-        trigger_interval = 30.0  # re-read FF01 every 30s as nudge
 
         # 4. Stream loop
         while True:
             try:
                 line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=10.0,
+                    proc.stdout.readline(), timeout=5.0,
                 )
             except asyncio.TimeoutError:
                 idle = time.time() - last_activity
                 if idle >= frame_timeout:
-                    LOG.warning("No data for %.0fs; reconnecting", idle)
+                    LOG.warning("No indication for %.0fs; reconnecting",
+                                idle)
                     break
-                # Periodically re-read FF01 as trigger while idle
-                since_trigger = time.time() - last_trigger
-                if since_trigger >= trigger_interval:
-                    LOG.info("Sending FF01 read trigger (idle %.0fs)",
-                             idle)
-                    await send_cmd(
-                        f"char-read-hnd 0x{FF01_VALUE_HANDLE:04x}")
-                    last_trigger = time.time()
                 continue
 
             if not line:
@@ -412,7 +394,7 @@ async def _run_gatttool(address: str, connect_timeout: float,
             if not text:
                 continue
 
-            if "disconnect" in text.lower():
+            if "disconnect" in text.lower() and "char-" not in text.lower():
                 LOG.warning("gatttool: disconnected")
                 break
 
