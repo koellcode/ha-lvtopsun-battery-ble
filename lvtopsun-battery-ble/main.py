@@ -173,7 +173,7 @@ async def build_mqtt_client(opts):
             mqtt_port = sup["port"]
             mqtt_user = mqtt_user or sup["username"]
             mqtt_pass = mqtt_pass or sup["password"]
-            LOG.info("MQTT discovered via Supervisor: %s:%d", mqtt_host, mqtt_port)
+            LOG.info("MQTT discovered via Supervisor: %s:%d user=%s", mqtt_host, mqtt_port, mqtt_user or "(none)")
 
     if not mqtt_host:
         LOG.error("No MQTT host configured and Supervisor discovery failed")
@@ -191,21 +191,27 @@ async def build_mqtt_client(opts):
     loop = asyncio.get_running_loop()
 
     def on_connect(_client, _userdata, _flags, rc, _properties=None):
+        # paho-mqtt v2: rc is a ReasonCode object
         if rc == 0:
             LOG.info("MQTT connected to %s:%d", mqtt_host, mqtt_port)
+            loop.call_soon_threadsafe(connected_event.set)
         else:
-            LOG.error("MQTT connect failed with rc=%d", rc)
-        loop.call_soon_threadsafe(connected_event.set)
+            LOG.error("MQTT connect failed: %s (user=%s)", rc, mqtt_user or "(none)")
+            # Don't set event — let it retry or timeout
 
     client.on_connect = on_connect
     client.connect(mqtt_host, mqtt_port, keepalive=60)
     client.loop_start()
 
-    # Block until on_connect fires (max 10s)
+    # Block until on_connect fires with success (max 10s)
     try:
         await asyncio.wait_for(connected_event.wait(), timeout=10)
     except asyncio.TimeoutError:
-        LOG.warning("MQTT on_connect not received within 10s — continuing anyway")
+        LOG.error(
+            "MQTT connection to %s:%d failed (timeout). user=%s",
+            mqtt_host, mqtt_port, mqtt_user or "(none)",
+        )
+        sys.exit(1)
 
     return client
 
