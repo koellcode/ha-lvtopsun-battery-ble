@@ -305,7 +305,7 @@ def _parse_indication_hex(hex_str: str) -> bytes:
 
 
 async def _run_gatttool(address: str, connect_timeout: float,
-                       assembler, frame_queue,
+                       frame_timeout: float, assembler, frame_queue,
                        publish_interval, mqttc, topic_base,
                        last_soc, last_pub_ts):
     """Run gatttool interactive mode with stdbuf for line-buffered output.
@@ -313,10 +313,6 @@ async def _run_gatttool(address: str, connect_timeout: float,
     Interactive mode is needed for ATT MTU exchange (the 'mtu' command).
     stdbuf -oL forces line-buffered stdout so indication events flush
     through pipes instead of getting stuck in stdio's full buffer.
-
-    Waits indefinitely for indications — the BMS auto-streams every ~84s
-    after indication subscription. Reconnection is handled by the caller
-    if the process exits or the BMS disconnects.
     """
     proc = await asyncio.create_subprocess_exec(
         "stdbuf", "-oL",
@@ -374,7 +370,16 @@ async def _run_gatttool(address: str, connect_timeout: float,
         except TimeoutError:
             LOG.warning("CCCD write response timed out")
 
-        LOG.info("Waiting for indications...")
+        # 3b. Read FF01 as trigger (macOS does this and always gets data)
+        await send_cmd(f"char-read-hnd 0x{FF01_VALUE_HANDLE:04x}")
+        try:
+            resp = await read_until("Characteristic value", timeout=5.0)
+            LOG.info("FF01 read: %s", resp.strip())
+        except TimeoutError:
+            LOG.warning("FF01 read timed out (non-fatal)")
+
+        LOG.info("Waiting for indications (timeout=%.0fs)...", frame_timeout)
+        last_activity = time.time()
 
         # 4. Stream loop
         while True:
@@ -383,6 +388,10 @@ async def _run_gatttool(address: str, connect_timeout: float,
                     proc.stdout.readline(), timeout=30.0,
                 )
             except asyncio.TimeoutError:
+                idle = time.time() - last_activity
+                if idle >= frame_timeout:
+                    LOG.warning("No data for %.0fs; reconnecting", idle)
+                    break
                 continue
 
             if not line:
@@ -404,6 +413,7 @@ async def _run_gatttool(address: str, connect_timeout: float,
                 LOG.info("Indication handle=0x%04x %d bytes",
                          handle, len(data_bytes))
                 assembler.feed(data_bytes)
+                last_activity = time.time()
 
                 while not frame_queue.empty():
                     try:
@@ -446,6 +456,7 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
 
     Scans for the device once, then reuses the MAC address for retries.
     """
+    frame_timeout = max(float(opts.get("frame_timeout", 180)), 30.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
     device_name = opts["device_name"]
@@ -486,7 +497,7 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                      attempt, max_attempts, address)
 
             last_soc, last_pub_ts = await _run_gatttool(
-                address, connect_timeout,
+                address, connect_timeout, frame_timeout,
                 assembler, frame_queue, publish_interval,
                 mqttc, topic_base, last_soc, last_pub_ts,
             )
@@ -518,8 +529,9 @@ async def run():
     )
 
     LOG.info("Starting LVTOPSUN Battery BLE add-on")
-    LOG.info("Device: %s  Poll: %ds",
-             opts["device_name"], opts["poll_interval"])
+    LOG.info("Device: %s  Poll: %ds  Frame timeout: %ds",
+             opts["device_name"], opts["poll_interval"],
+             opts.get("frame_timeout", 180))
 
     topic_base = opts.get("mqtt_topic", "lvtopsun_battery")
     mqttc = await build_mqtt_client(opts)
