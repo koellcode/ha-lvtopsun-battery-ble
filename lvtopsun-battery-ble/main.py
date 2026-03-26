@@ -2,6 +2,7 @@
 """LVTOPSUN Battery BLE → MQTT bridge for Home Assistant."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -11,6 +12,8 @@ import time
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.characteristic import BleakGATTCharacteristic
+from dbus_next.aio import MessageBus
+from dbus_next.constants import BusType
 import paho.mqtt.client as mqtt
 
 # ---------------------------------------------------------------------------
@@ -76,6 +79,82 @@ def discover_mqtt_from_supervisor():
     except Exception as exc:
         LOG.debug("Supervisor MQTT discovery failed: %s", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# BlueZ device state monitoring
+# ---------------------------------------------------------------------------
+
+async def resolve_bluez_device(bus, address: str):
+    """Return the BlueZ device path for a device address, or None if unavailable."""
+    introspection = await bus.introspect("org.bluez", "/")
+    obj = bus.get_proxy_object("org.bluez", "/", introspection)
+    manager = obj.get_interface("org.freedesktop.DBus.ObjectManager")
+    managed = await manager.call_get_managed_objects()
+    needle = address.upper()
+    for path, interfaces in managed.items():
+        device = interfaces.get("org.bluez.Device1")
+        if not device:
+            continue
+        device_address = device.get("Address")
+        if device_address and str(device_address.value).upper() == needle:
+            return path
+    return None
+
+
+class BlueZDeviceMonitor:
+    def __init__(self, bus, props, address: str, path: str, poll_interval: float = 0.5):
+        self._bus = bus
+        self._props = props
+        self._address = address
+        self._path = path
+        self._poll_interval = poll_interval
+
+    @classmethod
+    async def create(cls, address: str, poll_interval: float = 0.5):
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        path = await resolve_bluez_device(bus, address)
+        if not path:
+            if hasattr(bus, "disconnect"):
+                bus.disconnect()
+            return None
+        introspection = await bus.introspect("org.bluez", path)
+        obj = bus.get_proxy_object("org.bluez", path, introspection)
+        props = obj.get_interface("org.freedesktop.DBus.Properties")
+        return cls(bus, props, address, path, poll_interval=poll_interval)
+
+    async def read_state(self):
+        connected = await self._props.call_get("org.bluez.Device1", "Connected")
+        services_resolved = await self._props.call_get("org.bluez.Device1", "ServicesResolved")
+        return {
+            "connected": bool(connected.value),
+            "services_resolved": bool(services_resolved.value),
+        }
+
+    async def watch(self, stop_event: asyncio.Event, phase_getter):
+        last_state = None
+        try:
+            while not stop_event.is_set():
+                state = await self.read_state()
+                if state != last_state:
+                    LOG.info(
+                        "BlueZ state addr=%s path=%s connected=%s services_resolved=%s phase=%s",
+                        self._address,
+                        self._path,
+                        state["connected"],
+                        state["services_resolved"],
+                        phase_getter(),
+                    )
+                    last_state = state
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=self._poll_interval)
+                except asyncio.TimeoutError:
+                    continue
+        except Exception as exc:
+            LOG.warning("BlueZ monitor failed for %s: %s", self._address, exc)
+        finally:
+            if hasattr(self._bus, "disconnect"):
+                self._bus.disconnect()
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +375,19 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     probe_interval = max(float(opts.get("probe_interval", 5)), 1.0)
 
     disconnected_event = asyncio.Event()
+    monitor_stop_event = asyncio.Event()
     frame_queue = asyncio.Queue()
     last_frame_ts = time.time()
+    phase = "idle"
+
+    def set_phase(value: str):
+        nonlocal phase
+        if phase != value:
+            phase = value
+            LOG.info("BLE phase -> %s", phase)
+
+    def get_phase():
+        return phase
 
     def on_frame(frame: bytes):
         nonlocal last_frame_ts
@@ -320,12 +410,14 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
         assembler.feed(bytes(data))
 
     def on_disconnect(_client):
-        LOG.warning("BLE device disconnected unexpectedly")
+        LOG.warning("BLE device disconnected unexpectedly during phase=%s", phase)
         disconnected_event.set()
 
     last_exc = None
     max_attempts = 5
     for connect_attempt in range(1, max_attempts + 1):
+        bluez_monitor = None
+        bluez_task = None
         try:
             LOG.info(
                 "BLE connect attempt %d/%d to %s",
@@ -334,13 +426,25 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                 device.address,
             )
             disconnected_event.clear()
+            monitor_stop_event.clear()
+            set_phase("pre-connect")
 
+            try:
+                bluez_monitor = await BlueZDeviceMonitor.create(device.address)
+            except Exception as exc:
+                LOG.debug("BlueZ monitor unavailable for %s: %s", device.address, exc)
+                bluez_monitor = None
+            if bluez_monitor is not None:
+                bluez_task = asyncio.create_task(bluez_monitor.watch(monitor_stop_event, get_phase))
+
+            set_phase("connecting")
             async with BleakClient(
                 device,
                 timeout=connect_timeout,
                 disconnected_callback=on_disconnect,
             ) as client:
                 LOG.info("BLE connected: %s", client.is_connected)
+                set_phase("service-discovery")
 
                 # Log discovered services for debugging
                 for svc in client.services:
@@ -350,11 +454,13 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
 
                 # Subscribe to notifications/indications on FF01 immediately
                 LOG.info("Subscribing to FF01 indications...")
+                set_phase("subscribe-ff01")
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
 
                 try:
                     disconnected_event.clear()
                     last_frame_ts = time.time()
+                    set_phase("streaming")
                     LOG.info(
                         "Streaming BMS frames; idle timeout %.1fs; probe interval %.1fs",
                         frame_timeout,
@@ -362,12 +468,15 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                     )
 
                     try:
+                        set_phase("primer-read")
                         value = await client.read_gatt_char(CHAR_FF01_UUID)
                         LOG.debug("Initial FF01 primer read returned %d bytes", len(value))
                         if value:
                             assembler.feed(bytes(value))
                     except Exception as exc:
                         LOG.debug("Initial FF01 primer read failed: %s", exc)
+                    finally:
+                        set_phase("streaming")
 
                     while client.is_connected and not disconnected_event.is_set():
                         try:
@@ -388,18 +497,26 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                                     "No BMS frame received for %.1fs; reconnecting session",
                                     idle_for,
                                 )
+                                set_phase("idle-timeout")
                                 break
                             try:
+                                set_phase("keepalive-read")
                                 value = await client.read_gatt_char(CHAR_FF01_UUID)
                                 LOG.debug("FF01 keepalive read returned %d bytes", len(value))
                                 if value:
                                     assembler.feed(bytes(value))
                             except Exception as exc:
                                 LOG.debug("FF01 keepalive read failed: %s", exc)
+                            finally:
+                                if client.is_connected and not disconnected_event.is_set():
+                                    set_phase("streaming")
 
                     if disconnected_event.is_set():
                         LOG.info("BLE session ended after disconnect")
+                    elif not client.is_connected:
+                        LOG.info("BLE session ended because client.is_connected became false during phase=%s", phase)
                 finally:
+                    set_phase("cleanup")
                     try:
                         if client.is_connected:
                             await client.stop_notify(CHAR_FF01_UUID)
@@ -411,9 +528,20 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
 
         except Exception as exc:
             last_exc = exc
-            LOG.warning("BLE connect/discovery attempt %d failed: %s", connect_attempt, exc)
+            LOG.warning(
+                "BLE connect/discovery attempt %d failed during phase=%s: %s",
+                connect_attempt,
+                phase,
+                exc,
+            )
             if connect_attempt < max_attempts:
                 await asyncio.sleep(2)
+        finally:
+            monitor_stop_event.set()
+            if bluez_task is not None:
+                bluez_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await bluez_task
 
     if last_exc is not None:
         LOG.error("BLE error: %s", last_exc)
