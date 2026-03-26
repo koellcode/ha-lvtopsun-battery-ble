@@ -475,7 +475,7 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
         try:
             if attempt > 1:
                 await clear_bluez_cache(address)
-                await asyncio.sleep(2)
+                await asyncio.sleep(10)
 
             LOG.info("gatttool connect attempt %d/%d to %s",
                      attempt, max_attempts, address)
