@@ -323,7 +323,7 @@ async def _run_gatttool(address: str, connect_timeout: float,
     5. listen for Indication lines
     """
     proc = await asyncio.create_subprocess_exec(
-        "gatttool", "-b", address, "-I",
+        "gatttool", "-b", address, "-I", "-m", "200",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -368,10 +368,10 @@ async def _run_gatttool(address: str, connect_timeout: float,
         #     which exceed the default ATT MTU of 23 (20-byte payload).
         await send_cmd("mtu 200")
         try:
-            await read_until("MTU was exchanged", timeout=5.0)
-            LOG.info("MTU exchanged")
+            resp = await read_until("MTU", timeout=5.0)
+            LOG.info("MTU exchange response: %s", resp)
         except TimeoutError:
-            LOG.warning("MTU exchange timed out (proceeding anyway)")
+            LOG.warning("MTU exchange: no response (proceeding anyway)")
 
         # 3. Read FF01 (handshake — should return "C2 Value")
         await send_cmd(f"char-read-hnd 0x{FF01_VALUE_HANDLE:04x}")
@@ -436,8 +436,8 @@ async def _run_gatttool(address: str, connect_timeout: float,
             if m:
                 handle = int(m.group(1), 16)
                 data = _parse_indication_hex(m.group(2))
-                LOG.debug("Indication handle=0x%04x %d bytes",
-                          handle, len(data))
+                LOG.info("Indication handle=0x%04x %d bytes",
+                         handle, len(data))
                 assembler.feed(data)
                 last_frame_ts = time.time()
 
@@ -456,7 +456,7 @@ async def _run_gatttool(address: str, connect_timeout: float,
                     except asyncio.QueueEmpty:
                         break
             elif text:
-                LOG.debug("gatttool< %s", text)
+                LOG.info("gatttool< %s", text)
 
     finally:
         # Clean up gatttool process
