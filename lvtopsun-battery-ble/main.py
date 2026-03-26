@@ -438,21 +438,18 @@ async def _run_gatttool(address: str, connect_timeout: float,
     return last_soc, last_pub_ts
 
 
-async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
-    """Scan, connect via gatttool, stream indications, publish SOC.
+async def connect_and_stream(opts, mqttc, topic_base, address,
+                             last_soc, last_pub_ts):
+    """Connect via gatttool, stream indications, publish SOC.
 
     Uses gatttool instead of bleak/BleakClient to bypass BlueZ D-Bus
     StartNotify which causes the BMS to disconnect. gatttool writes
     the CCCD directly and handles ATT indication confirmations at
     the protocol level.
-
-    Scans for the device once, then reuses the MAC address for retries.
     """
     frame_timeout = max(float(opts.get("frame_timeout", 180)), 30.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
-    device_name = opts["device_name"]
-    scan_timeout = opts["scan_timeout"]
 
     frame_queue: asyncio.Queue = asyncio.Queue()
 
@@ -470,13 +467,6 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
 
     assembler = FrameAssembler(on_frame=on_frame)
 
-    # Scan once to discover the MAC address
-    device = await find_device(device_name, scan_timeout)
-    if device is None:
-        LOG.warning("Device '%s' not found", device_name)
-        return last_soc, last_pub_ts
-
-    address = device.address
     last_exc = None
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
@@ -534,10 +524,21 @@ async def run():
     last_soc = None
     last_pub_ts = 0.0
 
+    # Scan once at startup to discover the MAC address
+    device_name = opts["device_name"]
+    scan_timeout = opts["scan_timeout"]
+    device = await find_device(device_name, scan_timeout)
+    while device is None:
+        LOG.warning("Device '%s' not found, retrying in %ds",
+                    device_name, retry_delay)
+        await asyncio.sleep(retry_delay)
+        device = await find_device(device_name, scan_timeout)
+    address = device.address
+
     try:
         while True:
             last_soc, last_pub_ts = await connect_and_stream(
-                opts, mqttc, topic_base, last_soc, last_pub_ts,
+                opts, mqttc, topic_base, address, last_soc, last_pub_ts,
             )
             LOG.info("Reconnecting in %ds", retry_delay)
             await asyncio.sleep(retry_delay)
