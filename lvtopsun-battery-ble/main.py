@@ -243,6 +243,20 @@ async def find_device(name: str, timeout: float):
     return None
 
 
+def process_candidate_frame(data: bytes, result: dict, got_frame: asyncio.Event, source: str):
+    soc = decode_soc(data)
+    if soc is None:
+        LOG.debug("Ignoring %s payload (%d bytes): not a decodable telemetry frame", source, len(data))
+        return
+    result["soc"] = soc
+    voltage = decode_pack_voltage(data)
+    if voltage is None:
+        LOG.info("Decoded SOC=%d%% from %s payload", soc, source)
+    else:
+        LOG.info("Decoded SOC=%d%%, pack_voltage=%.2fV from %s payload", soc, voltage, source)
+    got_frame.set()
+
+
 async def read_once(opts):
     """Connect, subscribe, wait for one complete frame, return SOC or None."""
     device = await find_device(opts["device_name"], opts["scan_timeout"])
@@ -254,16 +268,7 @@ async def read_once(opts):
     got_frame = asyncio.Event()
 
     def on_frame(frame: bytes):
-        soc = decode_soc(frame)
-        if soc is not None:
-            result["soc"] = soc
-            LOG.debug(
-                "Frame decoded: %d bytes, SOC=%d%%",
-                len(frame), soc,
-            )
-        else:
-            LOG.warning("Frame received (%d bytes) but SOC decode failed", len(frame))
-        got_frame.set()
+        process_candidate_frame(frame, result, got_frame, "notify")
 
     assembler = FrameAssembler(on_frame=on_frame)
 
@@ -276,12 +281,36 @@ async def read_once(opts):
         ) as client:
             LOG.debug("BLE connected: %s", client.is_connected)
             await client.start_notify(CHAR_FF01_UUID, on_notify)
-            # The BMS auto-streams frames; wait up to 15s for one
+
+            # Some batteries do not auto-stream immediately on Linux/BlueZ.
+            # Probe FF01 directly while subscribed to trigger or retrieve data.
             try:
-                await asyncio.wait_for(got_frame.wait(), timeout=15.0)
-            except asyncio.TimeoutError:
-                LOG.warning("Timed out waiting for BMS frame")
-            await client.stop_notify(CHAR_FF01_UUID)
+                for attempt in range(1, 4):
+                    if got_frame.is_set():
+                        break
+                    try:
+                        value = await client.read_gatt_char(CHAR_FF01_UUID)
+                        LOG.debug("FF01 read attempt %d returned %d bytes", attempt, len(value))
+                        process_candidate_frame(bytes(value), result, got_frame, f"read-{attempt}")
+                    except Exception as exc:
+                        LOG.debug("FF01 read attempt %d failed: %s", attempt, exc)
+
+                    if got_frame.is_set():
+                        break
+
+                    try:
+                        await asyncio.wait_for(got_frame.wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        LOG.debug("No notify frame received after FF01 read attempt %d", attempt)
+
+                if not got_frame.is_set():
+                    LOG.warning("Timed out waiting for BMS frame after notify + direct reads")
+            finally:
+                try:
+                    if client.is_connected:
+                        await client.stop_notify(CHAR_FF01_UUID)
+                except Exception as exc:
+                    LOG.debug("Ignoring stop_notify cleanup failure: %s", exc)
     except Exception as exc:
         LOG.error("BLE error: %s", exc)
         return None
