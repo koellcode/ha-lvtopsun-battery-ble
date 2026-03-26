@@ -314,107 +314,67 @@ async def _run_gatttool(address: str, connect_timeout: float,
                        frame_timeout: float, assembler, frame_queue,
                        publish_interval, mqttc, topic_base,
                        last_soc, last_pub_ts):
-    """Run gatttool in interactive mode to connect and stream indications.
+    """Run gatttool in non-interactive mode with --listen.
 
-    Uses a PTY so gatttool's readline properly flushes async indication
-    output (without a TTY, indications stay in the C stdio buffer).
+    Uses gatttool's built-in --char-write-req + --listen mode which
+    properly registers the GAttrib event handler and handles ATT
+    indication confirmations.  PTY wrapper ensures output is flushed.
 
-    Sequence:
-    1. connect
-    2. char-read-hnd 0x0027 (FF01 value — handshake)
-    3. char-write-req 0x0028 0200 (CCCD — enable indications)
-    4. char-write-req 0x0025 01 (FF00 trigger)
-    5. listen for Indication lines
+    Command: gatttool -b <addr> -m 200 --char-write-req -a 0x0028 -n 0200 --listen
     """
     master_fd, slave_fd = pty.openpty()
     proc = subprocess.Popen(
-        ["gatttool", "-b", address, "-I", "-m", "200"],
-        stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+        ["gatttool", "-b", address, "-m", "200",
+         "--char-write-req", "-a",
+         f"0x{FF01_CCCD_HANDLE:04x}", "-n", "0200",
+         "--listen"],
+        stdout=slave_fd, stderr=slave_fd,
+        stdin=subprocess.DEVNULL,
     )
     os.close(slave_fd)
 
-    # Wrap master_fd for async reading
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
-    read_fd = os.dup(master_fd)
     transport, _ = await loop.connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader),
-        os.fdopen(read_fd, "rb", 0),
+        os.fdopen(master_fd, "rb", 0),
     )
     last_frame_ts = time.time()
 
     try:
-        def send_cmd(cmd: str):
-            LOG.debug("gatttool> %s", cmd)
-            os.write(master_fd, (cmd + "\n").encode())
+        # Wait for the write confirmation (means connect + CCCD write succeeded)
+        deadline = time.time() + connect_timeout
+        init_buf = ""
+        connected = False
+        while time.time() < deadline:
+            try:
+                data = await asyncio.wait_for(
+                    reader.read(4096),
+                    timeout=max(deadline - time.time(), 0.1),
+                )
+            except asyncio.TimeoutError:
+                continue
+            if not data:
+                raise ConnectionError("gatttool exited before connecting")
+            init_buf += data.decode(errors="replace")
+            if "successfully" in init_buf:
+                connected = True
+                LOG.info("gatttool: connected and CCCD written to %s",
+                         address)
+                break
+            # Log any errors we see during connect
+            for ln in init_buf.splitlines():
+                ln = ln.strip()
+                if ln and ("error" in ln.lower() or "fail" in ln.lower()):
+                    LOG.warning("gatttool: %s", ln)
 
-        async def read_until(pattern: str, timeout: float = 10.0):
-            deadline = time.time() + timeout
-            buf = ""
-            while time.time() < deadline:
-                try:
-                    data = await asyncio.wait_for(
-                        reader.read(4096),
-                        timeout=max(deadline - time.time(), 0.1),
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                if not data:
-                    raise ConnectionError("gatttool process exited")
-                buf += data.decode(errors="replace")
-                if pattern in buf:
-                    # Log non-empty lines for diagnostics
-                    for ln in buf.splitlines():
-                        ln = ln.strip()
-                        if ln:
-                            LOG.debug("gatttool< %s", ln)
-                    return buf
-            raise TimeoutError(f"Timed out waiting for '{pattern}'")
-
-        # 1. Connect
-        send_cmd("connect")
-        await read_until("Connection successful", timeout=connect_timeout)
-        LOG.info("gatttool: connected to %s", address)
-
-        # 2. Let BMS settle (name changes to ASR ~0.5s after connect)
-        await asyncio.sleep(1.0)
-
-        # 2b. Request larger MTU — BMS sends 100-byte indication chunks
-        #     which exceed the default ATT MTU of 23 (20-byte payload).
-        send_cmd("mtu 200")
-        try:
-            resp = await read_until("MTU", timeout=5.0)
-            LOG.info("MTU exchange response: %s", resp.strip())
-        except TimeoutError:
-            LOG.warning("MTU exchange: no response (proceeding anyway)")
-
-        # 3. Read FF01 (handshake — should return "C2 Value")
-        send_cmd(f"char-read-hnd 0x{FF01_VALUE_HANDLE:04x}")
-        try:
-            resp = await read_until("Characteristic value", timeout=5.0)
-            m = _CHAR_VALUE_RE.search(resp)
-            if m:
-                val_bytes = _parse_indication_hex(m.group(1))
-                LOG.info("FF01 initial read: %d bytes: %s",
-                         len(val_bytes), val_bytes.hex(" "))
-        except TimeoutError:
-            LOG.warning("FF01 initial read timed out")
-
-        # 4. Write CCCD to enable indications (0x0200)
-        send_cmd(
-            f"char-write-req 0x{FF01_CCCD_HANDLE:04x} 0200")
-        try:
-            await read_until("successfully", timeout=5.0)
-            LOG.info("CCCD indication enable written")
-        except TimeoutError:
-            LOG.warning("CCCD write response timed out")
-
-        LOG.info("Waiting for indications (timeout=%.0fs)", frame_timeout)
+        if not connected:
+            raise TimeoutError("gatttool connect/write timed out")
 
         LOG.info("Waiting for indications (timeout=%.0fs)", frame_timeout)
         last_frame_ts = time.time()
 
-        # 6. Stream loop — read from PTY for indication lines
+        # Stream loop — read from PTY for indication lines
         buf = ""
         while True:
             try:
@@ -441,7 +401,6 @@ async def _run_gatttool(address: str, connect_timeout: float,
                 if not text:
                     continue
 
-                # Check for disconnect
                 if "disconnect" in text.lower():
                     LOG.warning("gatttool: disconnected")
                     break
@@ -455,7 +414,6 @@ async def _run_gatttool(address: str, connect_timeout: float,
                     assembler.feed(data_bytes)
                     last_frame_ts = time.time()
 
-                    # Drain any queued decoded frames
                     while not frame_queue.empty():
                         try:
                             soc, _v, rx_ts = frame_queue.get_nowait()
@@ -477,14 +435,6 @@ async def _run_gatttool(address: str, connect_timeout: float,
 
     finally:
         transport.close()
-        try:
-            os.write(master_fd, b"disconnect\n")
-        except OSError:
-            pass
-        try:
-            os.close(master_fd)
-        except OSError:
-            pass
         try:
             proc.terminate()
             proc.wait(timeout=3)
