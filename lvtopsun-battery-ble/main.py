@@ -9,8 +9,6 @@ import sys
 import time
 
 import re
-import socket
-import struct
 
 from bleak import BleakScanner
 import paho.mqtt.client as mqtt
@@ -24,15 +22,11 @@ _BLOCK_BASE = 24
 # gatttool handles (from GATT service discovery)
 FF01_VALUE_HANDLE = 0x0027   # FF01 characteristic value
 FF01_CCCD_HANDLE  = 0x0028   # FF01 Client Characteristic Config
-FF00_VALUE_HANDLE = 0x0025   # FF00 (write) characteristic value
 
 # Regex to parse gatttool indication/notification output
 _INDICATION_RE = re.compile(
     r"(?:Indication|Notification)\s+handle\s*=\s*0x([0-9a-fA-F]+)\s+"
     r"value:\s*(.+)",
-)
-_CHAR_VALUE_RE = re.compile(
-    r"Characteristic value/descriptor:\s*(.+)",
 )
 
 LOG = logging.getLogger("lvtopsun")
@@ -311,7 +305,7 @@ def _parse_indication_hex(hex_str: str) -> bytes:
 
 
 async def _run_gatttool(address: str, connect_timeout: float,
-                       frame_timeout: float, assembler, frame_queue,
+                       assembler, frame_queue,
                        publish_interval, mqttc, topic_base,
                        last_soc, last_pub_ts):
     """Run gatttool interactive mode with stdbuf for line-buffered output.
@@ -319,6 +313,10 @@ async def _run_gatttool(address: str, connect_timeout: float,
     Interactive mode is needed for ATT MTU exchange (the 'mtu' command).
     stdbuf -oL forces line-buffered stdout so indication events flush
     through pipes instead of getting stuck in stdio's full buffer.
+
+    Waits indefinitely for indications — the BMS auto-streams every ~84s
+    after indication subscription. Reconnection is handled by the caller
+    if the process exits or the BMS disconnects.
     """
     proc = await asyncio.create_subprocess_exec(
         "stdbuf", "-oL",
@@ -327,7 +325,6 @@ async def _run_gatttool(address: str, connect_timeout: float,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    last_frame_ts = time.time()
 
     try:
         async def send_cmd(cmd: str):
@@ -377,20 +374,15 @@ async def _run_gatttool(address: str, connect_timeout: float,
         except TimeoutError:
             LOG.warning("CCCD write response timed out")
 
-        LOG.info("Waiting for indications (timeout=%.0fs)", frame_timeout)
-        last_frame_ts = time.time()
+        LOG.info("Waiting for indications...")
 
         # 4. Stream loop
         while True:
             try:
                 line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=5.0,
+                    proc.stdout.readline(), timeout=30.0,
                 )
             except asyncio.TimeoutError:
-                idle = time.time() - last_frame_ts
-                if idle >= frame_timeout:
-                    LOG.warning("No frame for %.0fs; reconnecting", idle)
-                    break
                 continue
 
             if not line:
@@ -412,7 +404,6 @@ async def _run_gatttool(address: str, connect_timeout: float,
                 LOG.info("Indication handle=0x%04x %d bytes",
                          handle, len(data_bytes))
                 assembler.feed(data_bytes)
-                last_frame_ts = time.time()
 
                 while not frame_queue.empty():
                     try:
@@ -452,8 +443,9 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
     StartNotify which causes the BMS to disconnect. gatttool writes
     the CCCD directly and handles ATT indication confirmations at
     the protocol level.
+
+    Scans for the device once, then reuses the MAC address for retries.
     """
-    frame_timeout = max(float(opts.get("frame_timeout", 120)), 5.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
     device_name = opts["device_name"]
@@ -475,30 +467,26 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
 
     assembler = FrameAssembler(on_frame=on_frame)
 
+    # Scan once to discover the MAC address
+    device = await find_device(device_name, scan_timeout)
+    if device is None:
+        LOG.warning("Device '%s' not found", device_name)
+        return last_soc, last_pub_ts
+
+    address = device.address
     last_exc = None
-    last_address = None
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            # Clear BlueZ cache before scanning (if we know the address).
-            if last_address:
-                await clear_bluez_cache(last_address)
-
-            # Fresh scan each attempt so BlueZ re-discovers the device.
-            device = await find_device(device_name, scan_timeout)
-            if device is None:
-                LOG.warning("Device '%s' not found (attempt %d/%d)",
-                            device_name, attempt, max_attempts)
-                if attempt < max_attempts:
-                    await asyncio.sleep(2)
-                continue
-            last_address = device.address
+            if attempt > 1:
+                await clear_bluez_cache(address)
+                await asyncio.sleep(2)
 
             LOG.info("gatttool connect attempt %d/%d to %s",
-                     attempt, max_attempts, device.address)
+                     attempt, max_attempts, address)
 
             last_soc, last_pub_ts = await _run_gatttool(
-                device.address, connect_timeout, frame_timeout,
+                address, connect_timeout,
                 assembler, frame_queue, publish_interval,
                 mqttc, topic_base, last_soc, last_pub_ts,
             )
@@ -508,8 +496,6 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
         except Exception as exc:
             last_exc = exc
             LOG.warning("gatttool attempt %d failed: %s", attempt, exc)
-            if attempt < max_attempts:
-                await asyncio.sleep(2)
 
     if last_exc is not None:
         LOG.error("BLE error after %d attempts: %s", max_attempts, last_exc)
@@ -532,9 +518,8 @@ async def run():
     )
 
     LOG.info("Starting LVTOPSUN Battery BLE add-on")
-    LOG.info("Device: %s  Poll: %ds  Frame timeout: %ds",
-             opts["device_name"], opts["poll_interval"],
-             opts.get("frame_timeout", 120))
+    LOG.info("Device: %s  Poll: %ds",
+             opts["device_name"], opts["poll_interval"])
 
     topic_base = opts.get("mqtt_topic", "lvtopsun_battery")
     mqttc = await build_mqtt_client(opts)
