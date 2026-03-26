@@ -290,34 +290,27 @@ async def read_once(opts):
                 LOG.debug("BLE connected: %s", client.is_connected)
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
 
-                # Some batteries do not auto-stream immediately on Linux/BlueZ.
-                # Probe FF01 directly while subscribed to trigger or retrieve data.
+                # Match the original working decode flow as closely as possible:
+                # subscribe, then mostly wait for notifications to arrive.
                 try:
-                    deadline = asyncio.get_running_loop().time() + frame_timeout
-                    attempt = 0
-                    while not got_frame.is_set():
-                        remaining = deadline - asyncio.get_running_loop().time()
-                        if remaining <= 0:
-                            break
-                        attempt += 1
+                    LOG.info("Waiting up to %.1fs for BMS notify frame", frame_timeout)
+                    try:
+                        await asyncio.wait_for(got_frame.wait(), timeout=frame_timeout)
+                    except asyncio.TimeoutError:
+                        LOG.warning(
+                            "No notify frame after %.1fs, trying one fallback FF01 read",
+                            frame_timeout,
+                        )
                         try:
                             value = await client.read_gatt_char(CHAR_FF01_UUID)
-                            LOG.debug("FF01 read attempt %d returned %d bytes", attempt, len(value))
-                            process_candidate_frame(bytes(value), result, got_frame, f"read-{attempt}")
+                            LOG.debug("Fallback FF01 read returned %d bytes", len(value))
+                            process_candidate_frame(bytes(value), result, got_frame, "fallback-read")
                         except Exception as exc:
-                            LOG.debug("FF01 read attempt %d failed: %s", attempt, exc)
-
-                        if got_frame.is_set():
-                            break
-
-                        try:
-                            await asyncio.wait_for(got_frame.wait(), timeout=min(15.0, remaining))
-                        except asyncio.TimeoutError:
-                            LOG.debug("No notify frame received after FF01 read attempt %d", attempt)
+                            LOG.debug("Fallback FF01 read failed: %s", exc)
 
                     if not got_frame.is_set():
                         LOG.warning(
-                            "Timed out waiting %.1fs for BMS frame after notify + direct reads",
+                            "Timed out waiting %.1fs for BMS frame",
                             frame_timeout,
                         )
                 finally:
