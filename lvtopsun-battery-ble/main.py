@@ -403,6 +403,9 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     phase = "idle"
     session_started_at = None
     session_frame_count = 0
+    session_notify_count = 0
+    session_notify_bytes = 0
+    first_notify_preview_logged = False
 
     def set_phase(value: str):
         nonlocal phase
@@ -431,6 +434,17 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
     assembler = FrameAssembler(on_frame=on_frame)
 
     def on_notify(_char: BleakGATTCharacteristic, data: bytearray):
+        nonlocal session_notify_count, session_notify_bytes, first_notify_preview_logged
+        session_notify_count += 1
+        session_notify_bytes += len(data)
+        if not first_notify_preview_logged:
+            preview = bytes(data[:12]).hex(" ").upper()
+            LOG.info(
+                "First FF01 notification received: len=%d preview=%s",
+                len(data),
+                preview,
+            )
+            first_notify_preview_logged = True
         LOG.debug("BLE notification/indication: %d bytes", len(data))
         assembler.feed(bytes(data))
 
@@ -540,6 +554,9 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                     last_frame_ts = time.time()
                     session_started_at = time.time()
                     session_frame_count = 0
+                    session_notify_count = 0
+                    session_notify_bytes = 0
+                    first_notify_preview_logged = False
 
                     await maybe_send_ff00_request(client, "after-subscribe")
                     if disconnected_event.is_set() or not client.is_connected:
@@ -584,17 +601,21 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_publish_ts)
                     if disconnected_event.is_set():
                         session_runtime = (time.time() - session_started_at) if session_started_at else 0.0
                         LOG.info(
-                            "BLE session ended after disconnect; runtime=%.1fs frames=%d",
+                            "BLE session ended after disconnect; runtime=%.1fs frames=%d notifications=%d bytes=%d",
                             session_runtime,
                             session_frame_count,
+                            session_notify_count,
+                            session_notify_bytes,
                         )
                     elif not client.is_connected:
                         session_runtime = (time.time() - session_started_at) if session_started_at else 0.0
                         LOG.info(
-                            "BLE session ended because client.is_connected became false during phase=%s; runtime=%.1fs frames=%d",
+                            "BLE session ended because client.is_connected became false during phase=%s; runtime=%.1fs frames=%d notifications=%d bytes=%d",
                             phase,
                             session_runtime,
                             session_frame_count,
+                            session_notify_count,
+                            session_notify_bytes,
                         )
                 finally:
                     set_phase("cleanup")
