@@ -8,17 +8,31 @@ import os
 import sys
 import time
 
-from bleak import BleakClient, BleakScanner
-from bleak.backends.characteristic import BleakGATTCharacteristic
+import re
+import subprocess
+
+from bleak import BleakScanner
 import paho.mqtt.client as mqtt
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CHAR_FF00_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"  # Write char
-CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"  # Indicate char
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
+
+# gatttool handles (from GATT service discovery)
+FF01_VALUE_HANDLE = 0x0027   # FF01 characteristic value
+FF01_CCCD_HANDLE  = 0x0028   # FF01 Client Characteristic Config
+FF00_VALUE_HANDLE = 0x0025   # FF00 (write) characteristic value
+
+# Regex to parse gatttool indication/notification output
+_INDICATION_RE = re.compile(
+    r"(?:Indication|Notification)\s+handle\s*=\s*0x([0-9a-fA-F]+)\s+"
+    r"value:\s*(.+)",
+)
+_CHAR_VALUE_RE = re.compile(
+    r"Characteristic value/descriptor:\s*(.+)",
+)
 
 LOG = logging.getLogger("lvtopsun")
 
@@ -290,12 +304,174 @@ async def clear_bluez_cache(address: str):
         LOG.debug("bluetoothctl remove failed (non-fatal): %s", exc)
 
 
-async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
-    """Scan, connect, subscribe FF01, stream frames, publish SOC.
+def _parse_indication_hex(hex_str: str) -> bytes:
+    """Parse space-separated hex string from gatttool output."""
+    return bytes.fromhex(hex_str.replace(" ", ""))
 
-    Each attempt does: clear cache → scan → connect → subscribe → stream.
-    After subscribing, writes a trigger byte to FF00 to kick the BMS
-    into sending telemetry (some BMS firmware requires this on BlueZ).
+
+async def _run_gatttool(address: str, connect_timeout: float,
+                       frame_timeout: float, assembler, frame_queue,
+                       publish_interval, mqttc, topic_base,
+                       last_soc, last_pub_ts):
+    """Run gatttool in interactive mode to connect and stream indications.
+
+    Sequence:
+    1. connect
+    2. char-read-hnd 0x0027 (FF01 value — handshake)
+    3. char-write-req 0x0028 0200 (CCCD — enable indications)
+    4. char-write-req 0x0025 01 (FF00 trigger)
+    5. listen for Indication lines
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "gatttool", "-b", address, "-I",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    last_frame_ts = time.time()
+
+    try:
+        # Helper to send a command and wait for a response line.
+        async def send_cmd(cmd: str, timeout: float = 10.0):
+            LOG.debug("gatttool> %s", cmd)
+            proc.stdin.write((cmd + "\n").encode())
+            await proc.stdin.drain()
+
+        async def read_until(pattern: str, timeout: float = 10.0):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(),
+                        timeout=max(deadline - time.time(), 0.1),
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                if not line:
+                    raise ConnectionError("gatttool process exited")
+                text = line.decode(errors="replace").strip()
+                if text:
+                    LOG.debug("gatttool< %s", text)
+                if pattern in text:
+                    return text
+            raise TimeoutError(f"Timed out waiting for '{pattern}'")
+
+        # 1. Connect
+        await send_cmd("connect")
+        await read_until("Connection successful", timeout=connect_timeout)
+        LOG.info("gatttool: connected to %s", address)
+
+        # 2. Let BMS settle (name changes to ASR ~0.5s after connect)
+        await asyncio.sleep(1.0)
+
+        # 3. Read FF01 (handshake — should return "C2 Value")
+        await send_cmd(f"char-read-hnd 0x{FF01_VALUE_HANDLE:04x}")
+        try:
+            resp = await read_until("Characteristic value", timeout=5.0)
+            m = _CHAR_VALUE_RE.search(resp)
+            if m:
+                val_bytes = _parse_indication_hex(m.group(1))
+                LOG.info("FF01 initial read: %d bytes: %s",
+                         len(val_bytes), val_bytes.hex(" "))
+        except TimeoutError:
+            LOG.warning("FF01 initial read timed out")
+
+        # 4. Write CCCD to enable indications (0x0200)
+        await send_cmd(
+            f"char-write-req 0x{FF01_CCCD_HANDLE:04x} 0200")
+        try:
+            await read_until("successfully", timeout=5.0)
+            LOG.info("CCCD indication enable written")
+        except TimeoutError:
+            LOG.warning("CCCD write response timed out")
+
+        # 5. Write trigger byte to FF00
+        await send_cmd(
+            f"char-write-req 0x{FF00_VALUE_HANDLE:04x} 01")
+        try:
+            await read_until("successfully", timeout=5.0)
+            LOG.info("FF00 trigger written")
+        except TimeoutError:
+            LOG.warning("FF00 trigger write response timed out")
+
+        LOG.info("Waiting for indications (timeout=%.0fs)", frame_timeout)
+        last_frame_ts = time.time()
+
+        # 6. Stream loop — read stdout for indication lines
+        while True:
+            try:
+                line = await asyncio.wait_for(
+                    proc.stdout.readline(), timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                idle = time.time() - last_frame_ts
+                if idle >= frame_timeout:
+                    LOG.warning("No frame for %.0fs; reconnecting", idle)
+                    break
+                continue
+
+            if not line:
+                LOG.warning("gatttool process exited")
+                break
+
+            text = line.decode(errors="replace").strip()
+            if not text:
+                continue
+
+            # Check for disconnect
+            if "disconnect" in text.lower():
+                LOG.warning("gatttool: disconnected")
+                break
+
+            m = _INDICATION_RE.search(text)
+            if m:
+                handle = int(m.group(1), 16)
+                data = _parse_indication_hex(m.group(2))
+                LOG.debug("Indication handle=0x%04x %d bytes",
+                          handle, len(data))
+                assembler.feed(data)
+                last_frame_ts = time.time()
+
+                # Drain any queued decoded frames
+                while not frame_queue.empty():
+                    try:
+                        soc, _v, rx_ts = frame_queue.get_nowait()
+                        if (soc != last_soc
+                                or (rx_ts - last_pub_ts)
+                                >= publish_interval):
+                            publish_state(mqttc, topic_base, soc)
+                            publish_availability(
+                                mqttc, topic_base, True)
+                            last_soc = soc
+                            last_pub_ts = rx_ts
+                    except asyncio.QueueEmpty:
+                        break
+            elif text:
+                LOG.debug("gatttool< %s", text)
+
+    finally:
+        # Clean up gatttool process
+        try:
+            proc.stdin.write(b"disconnect\n")
+            await proc.stdin.drain()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except Exception:
+            proc.kill()
+
+    return last_soc, last_pub_ts
+
+
+async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
+    """Scan, connect via gatttool, stream indications, publish SOC.
+
+    Uses gatttool instead of bleak/BleakClient to bypass BlueZ D-Bus
+    StartNotify which causes the BMS to disconnect. gatttool writes
+    the CCCD directly and handles ATT indication confirmations at
+    the protocol level.
     """
     frame_timeout = max(float(opts.get("frame_timeout", 120)), 5.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
@@ -303,12 +479,9 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
     device_name = opts["device_name"]
     scan_timeout = opts["scan_timeout"]
 
-    disconnected_event = asyncio.Event()
     frame_queue: asyncio.Queue = asyncio.Queue()
-    last_frame_ts = time.time()
 
     def on_frame(frame: bytes):
-        nonlocal last_frame_ts
         soc = decode_soc(frame)
         if soc is None:
             LOG.debug("Ignoring %d-byte payload: not decodable", len(frame))
@@ -318,18 +491,9 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
             LOG.info("Decoded SOC=%d%%, pack=%.2fV", soc, voltage)
         else:
             LOG.info("Decoded SOC=%d%%", soc)
-        last_frame_ts = time.time()
         frame_queue.put_nowait((soc, voltage, time.time()))
 
     assembler = FrameAssembler(on_frame=on_frame)
-
-    def on_notify(_char: BleakGATTCharacteristic, data: bytearray):
-        LOG.debug("BLE indication: %d bytes", len(data))
-        assembler.feed(bytes(data))
-
-    def on_disconnect(_client):
-        LOG.warning("BLE disconnected")
-        disconnected_event.set()
 
     last_exc = None
     last_address = None
@@ -350,109 +514,20 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                 continue
             last_address = device.address
 
-            LOG.info("BLE connect attempt %d/%d to %s",
+            LOG.info("gatttool connect attempt %d/%d to %s",
                      attempt, max_attempts, device.address)
-            disconnected_event.clear()
 
-            async with BleakClient(
-                device,
-                timeout=connect_timeout,
-                disconnected_callback=on_disconnect,
-            ) as client:
-                LOG.info("BLE connected")
-
-                # Log FF01 characteristic properties for debugging.
-                char = client.services.get_characteristic(
-                    CHAR_FF01_UUID)
-                if char:
-                    LOG.info("FF01 properties: %s", char.properties)
-                else:
-                    LOG.warning("FF01 characteristic not found!")
-
-                # Let BMS settle after connect (name changes
-                # to "ASR" ~0.5s after connect).
-                await asyncio.sleep(1.0)
-
-                # Read FF01 before subscribing — matches the
-                # macOS proxy sequence where the first operation
-                # is a read returning "C2 Value".
-                try:
-                    init_val = await client.read_gatt_char(
-                        CHAR_FF01_UUID)
-                    LOG.info("FF01 initial read: %d bytes: %s",
-                             len(init_val), init_val.hex(" "))
-                except Exception as e:
-                    LOG.warning("FF01 initial read failed: %s", e)
-
-                await client.start_notify(CHAR_FF01_UUID, on_notify)
-                LOG.info("Subscribed to FF01 indications")
-
-                # Write trigger byte to FF00 after subscribe.
-                try:
-                    await client.write_gatt_char(
-                        CHAR_FF00_UUID, b"\x01")
-                    LOG.info("Wrote trigger to FF00")
-                except Exception as e:
-                    LOG.warning("FF00 trigger write failed: %s", e)
-
-                LOG.info("Waiting for frames (timeout=%.0fs)",
-                         frame_timeout)
-
-                # Clear disconnect flag right before streaming — BlueZ
-                # may fire disconnect during connect/service-discovery.
-                disconnected_event.clear()
-                last_frame_ts = time.time()
-
-                try:
-                    diag_done = False
-                    while (client.is_connected
-                           and not disconnected_event.is_set()):
-                        try:
-                            soc, _v, rx_ts = await asyncio.wait_for(
-                                frame_queue.get(), timeout=5.0,
-                            )
-                            if (soc != last_soc
-                                    or (rx_ts - last_pub_ts)
-                                    >= publish_interval):
-                                publish_state(mqttc, topic_base, soc)
-                                publish_availability(
-                                    mqttc, topic_base, True)
-                                last_soc = soc
-                                last_pub_ts = rx_ts
-                        except asyncio.TimeoutError:
-                            idle = time.time() - last_frame_ts
-                            # Diagnostic: if no indication after 10s,
-                            # try a manual read of FF01.
-                            if idle >= 10 and not diag_done:
-                                diag_done = True
-                                try:
-                                    val = await client.read_gatt_char(
-                                        CHAR_FF01_UUID)
-                                    LOG.info(
-                                        "Diagnostic FF01 read: %d "
-                                        "bytes: %s",
-                                        len(val), val.hex(" "))
-                                except Exception as e:
-                                    LOG.warning(
-                                        "Diagnostic FF01 read "
-                                        "failed: %s", e)
-                            if idle >= frame_timeout:
-                                LOG.warning("No frame for %.0fs; "
-                                            "reconnecting", idle)
-                                break
-                finally:
-                    try:
-                        if client.is_connected:
-                            await client.stop_notify(CHAR_FF01_UUID)
-                    except Exception:
-                        pass
-
+            last_soc, last_pub_ts = await _run_gatttool(
+                device.address, connect_timeout, frame_timeout,
+                assembler, frame_queue, publish_interval,
+                mqttc, topic_base, last_soc, last_pub_ts,
+            )
             last_exc = None
             break
 
         except Exception as exc:
             last_exc = exc
-            LOG.warning("BLE attempt %d failed: %s", attempt, exc)
+            LOG.warning("gatttool attempt %d failed: %s", attempt, exc)
             if attempt < max_attempts:
                 await asyncio.sleep(2)
 
@@ -476,7 +551,7 @@ async def run():
         stream=sys.stdout,
     )
 
-    # Always enable debug for bleak to trace BLE subscription issues.
+    # Enable debug for bleak (scanning) and gatttool output.
     logging.getLogger("bleak").setLevel(logging.DEBUG)
 
     LOG.info("Starting LVTOPSUN Battery BLE add-on")
