@@ -16,8 +16,6 @@ import paho.mqtt.client as mqtt
 # Constants
 # ---------------------------------------------------------------------------
 CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
-CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
-CCCD_INDICATE = b"\x02\x00"  # Enable indications (not notifications)
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
@@ -275,6 +273,22 @@ async def find_device(name: str, timeout: float):
     return None
 
 
+async def clear_bluez_cache(address: str):
+    """Remove device from BlueZ to clear cached GATT database."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bluetoothctl", "remove", address,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        LOG.info("bluetoothctl remove %s: rc=%d %s",
+                 address, proc.returncode,
+                 (stdout or stderr or b"").decode().strip())
+    except Exception as exc:
+        LOG.debug("bluetoothctl remove failed (non-fatal): %s", exc)
+
+
 async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
     """Connect, subscribe FF01 indications, stream frames, publish SOC.
 
@@ -327,6 +341,10 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                      attempt, max_attempts, device.address)
             disconnected_event.clear()
 
+            # Clear BlueZ GATT cache to force fresh service discovery.
+            await clear_bluez_cache(device.address)
+            await asyncio.sleep(1.0)
+
             async with BleakClient(
                 device,
                 timeout=connect_timeout,
@@ -342,18 +360,9 @@ async def connect_and_stream(opts, mqttc, topic_base, last_soc, last_pub_ts):
                 else:
                     LOG.warning("FF01 characteristic not found!")
 
-                # Manually write CCCD to enable indications (0x0002).
-                # bleak's start_notify may write 0x0001 (notify) instead
-                # of 0x0002 (indicate) on some BlueZ versions, causing
-                # the BMS to disconnect.
-                if char:
-                    for desc in char.descriptors:
-                        if CCCD_UUID in str(desc.uuid):
-                            LOG.info("Writing CCCD indicate to %s",
-                                     desc.uuid)
-                            await client.write_gatt_descriptor(
-                                desc.handle, CCCD_INDICATE)
-                            break
+                # Brief settle after connect — give BlueZ time to
+                # stabilize the connection before subscribing.
+                await asyncio.sleep(1.0)
 
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
                 LOG.info("Subscribed to FF01; waiting for frames "
