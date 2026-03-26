@@ -159,7 +159,7 @@ def decode_pack_voltage(frame: bytes):
 # MQTT helpers
 # ---------------------------------------------------------------------------
 
-def build_mqtt_client(opts):
+async def build_mqtt_client(opts):
     mqtt_host = opts.get("mqtt_host") or ""
     mqtt_port = opts.get("mqtt_port", 1883)
     mqtt_user = opts.get("mqtt_username") or ""
@@ -185,9 +185,28 @@ def build_mqtt_client(opts):
     )
     if mqtt_user:
         client.username_pw_set(mqtt_user, mqtt_pass)
+
+    # Wait for actual connection before returning
+    connected_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def on_connect(_client, _userdata, _flags, rc, _properties=None):
+        if rc == 0:
+            LOG.info("MQTT connected to %s:%d", mqtt_host, mqtt_port)
+        else:
+            LOG.error("MQTT connect failed with rc=%d", rc)
+        loop.call_soon_threadsafe(connected_event.set)
+
+    client.on_connect = on_connect
     client.connect(mqtt_host, mqtt_port, keepalive=60)
     client.loop_start()
-    LOG.info("MQTT connected to %s:%d", mqtt_host, mqtt_port)
+
+    # Block until on_connect fires (max 10s)
+    try:
+        await asyncio.wait_for(connected_event.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        LOG.warning("MQTT on_connect not received within 10s — continuing anyway")
+
     return client
 
 
@@ -451,7 +470,7 @@ async def run():
     )
 
     topic_base = opts.get("mqtt_topic", "lvtopsun_battery")
-    mqttc = build_mqtt_client(opts)
+    mqttc = await build_mqtt_client(opts)
     publish_ha_discovery(mqttc, topic_base)
     publish_availability(mqttc, topic_base, True)
 
