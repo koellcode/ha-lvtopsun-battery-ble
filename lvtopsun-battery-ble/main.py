@@ -351,16 +351,21 @@ async def read_once(opts):
                     for char in svc.characteristics:
                         LOG.debug("  Char: %s  props=%s", char.uuid, char.properties)
 
-                # Small settle delay — BlueZ sometimes needs time after connect
-                await asyncio.sleep(1.0)
+                # Short settle delay after connect
+                await asyncio.sleep(0.3)
 
                 # Subscribe to notifications/indications on FF01
                 LOG.info("Subscribing to FF01 indications...")
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
 
-                # On BlueZ, start_notify may not correctly enable indications
-                # (vs notifications). Explicitly write the CCCD as a safeguard.
-                await _enable_indications_manually(client, CHAR_FF01_UUID)
+                # Read FF01 immediately as a keep-alive ping — some BMS
+                # firmware drops the connection after ~4 s of idle time.
+                try:
+                    init_val = await client.read_gatt_char(CHAR_FF01_UUID)
+                    LOG.debug("Initial FF01 read: %d bytes", len(init_val))
+                    assembler.feed(bytes(init_val))
+                except Exception as exc:
+                    LOG.debug("Initial FF01 read failed (non-fatal): %s", exc)
 
                 try:
                     LOG.info("Waiting up to %.1fs for BMS frame", frame_timeout)
