@@ -16,7 +16,7 @@ options:
   device_name: "LLM_UNAZAY_0008FR"
   scan_timeout: 10
   connect_timeout: 15
-  frame_timeout: 45
+  frame_timeout: 120
   poll_interval: 30
   mqtt_host: ""
   mqtt_port: 1883

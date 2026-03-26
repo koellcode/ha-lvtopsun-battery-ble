@@ -35,7 +35,7 @@ def load_options():
         "device_name": os.environ.get("DEVICE_NAME", "LLM_UNAZAY_0008FR"),
         "scan_timeout": int(os.environ.get("SCAN_TIMEOUT", "10")),
         "connect_timeout": int(os.environ.get("CONNECT_TIMEOUT", "15")),
-        "frame_timeout": int(os.environ.get("FRAME_TIMEOUT", "45")),
+        "frame_timeout": int(os.environ.get("FRAME_TIMEOUT", "120")),
         "poll_interval": int(os.environ.get("POLL_INTERVAL", "30")),
         "mqtt_host": os.environ.get("MQTT_HOST", ""),
         "mqtt_port": int(os.environ.get("MQTT_PORT", "1883")),
@@ -267,7 +267,7 @@ async def read_once(opts):
 
     result = {}
     got_frame = asyncio.Event()
-    frame_timeout = max(float(opts.get("frame_timeout", 45)), 5.0)
+    frame_timeout = max(float(opts.get("frame_timeout", 120)), 5.0)
 
     def on_frame(frame: bytes):
         process_candidate_frame(frame, result, got_frame, "notify")
@@ -348,7 +348,7 @@ async def run():
         "Device: %s  Poll interval: %ds  Frame timeout: %ss",
         opts["device_name"],
         opts["poll_interval"],
-        opts.get("frame_timeout", 45),
+        opts.get("frame_timeout", 120),
     )
 
     topic_base = opts.get("mqtt_topic", "lvtopsun_battery")
