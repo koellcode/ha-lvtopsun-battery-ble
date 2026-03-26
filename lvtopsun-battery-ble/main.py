@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import struct
 import sys
 import time
 
@@ -16,6 +17,10 @@ import paho.mqtt.client as mqtt
 # Constants
 # ---------------------------------------------------------------------------
 CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+# CCCD descriptor UUID (standard BLE)
+CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
+# CCCD value to enable indications (little-endian 0x0002)
+CCCD_INDICATE_ENABLE = b"\x02\x00"
 FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
@@ -238,10 +243,47 @@ async def find_device(name: str, timeout: float):
     devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
     for d, adv in devices.values():
         dname = d.name or adv.local_name or ""
+        # Match against name or address (BMS may advertise as "ASR" on Linux)
         if name.lower() in dname.lower() or name.lower() in d.address.lower():
             LOG.info("Found device: %s addr=%s RSSI=%s", dname, d.address, adv.rssi)
             return d
+    # If no match by configured name, also try "ASR" (known BMS advertising name)
+    if name.lower() != "asr":
+        for d, adv in devices.values():
+            dname = d.name or adv.local_name or ""
+            if "asr" == dname.lower():
+                LOG.info(
+                    "Found device by fallback name 'ASR': %s addr=%s RSSI=%s",
+                    dname, d.address, adv.rssi,
+                )
+                return d
     return None
+
+
+async def _enable_indications_manually(client, char_uuid):
+    """Manually write the CCCD descriptor to enable indications.
+
+    BlueZ sometimes doesn't correctly enable indications via start_notify().
+    This writes 0x0002 (indicate enable) to the CCCD descriptor directly.
+    """
+    for svc in client.services:
+        for char in svc.characteristics:
+            if char.uuid == char_uuid:
+                for desc in char.descriptors:
+                    if desc.uuid == CCCD_UUID:
+                        LOG.debug(
+                            "Writing CCCD indication enable (0x0002) to descriptor handle 0x%04X",
+                            desc.handle,
+                        )
+                        try:
+                            await client.write_gatt_descriptor(desc.handle, CCCD_INDICATE_ENABLE)
+                            LOG.debug("CCCD indication enable written successfully")
+                            return True
+                        except Exception as exc:
+                            LOG.warning("CCCD write failed: %s", exc)
+                            return False
+    LOG.debug("CCCD descriptor not found for %s", char_uuid)
+    return False
 
 
 def process_candidate_frame(data: bytes, result: dict, got_frame: asyncio.Event, source: str):
@@ -270,13 +312,21 @@ async def read_once(opts):
     frame_timeout = max(float(opts.get("frame_timeout", 120)), 5.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
 
+    disconnected_event = asyncio.Event()
+
     def on_frame(frame: bytes):
+        LOG.debug("Complete frame received: %d bytes, header=%s", len(frame), frame[:4].hex())
         process_candidate_frame(frame, result, got_frame, "notify")
 
     assembler = FrameAssembler(on_frame=on_frame)
 
     def on_notify(_char: BleakGATTCharacteristic, data: bytearray):
+        LOG.debug("BLE notification/indication: %d bytes", len(data))
         assembler.feed(bytes(data))
+
+    def on_disconnect(client):
+        LOG.warning("BLE device disconnected unexpectedly")
+        disconnected_event.set()
 
     last_exc = None
     for connect_attempt in range(1, 4):
@@ -286,19 +336,57 @@ async def read_once(opts):
                 connect_attempt,
                 device.address,
             )
-            async with BleakClient(device, timeout=connect_timeout) as client:
-                LOG.debug("BLE connected: %s", client.is_connected)
+            disconnected_event.clear()
+
+            async with BleakClient(
+                device,
+                timeout=connect_timeout,
+                disconnected_callback=on_disconnect,
+            ) as client:
+                LOG.info("BLE connected: %s", client.is_connected)
+
+                # Log discovered services for debugging
+                for svc in client.services:
+                    LOG.debug("Service: %s", svc.uuid)
+                    for char in svc.characteristics:
+                        LOG.debug("  Char: %s  props=%s", char.uuid, char.properties)
+
+                # Small settle delay — BlueZ sometimes needs time after connect
+                await asyncio.sleep(1.0)
+
+                # Subscribe to notifications/indications on FF01
+                LOG.info("Subscribing to FF01 indications...")
                 await client.start_notify(CHAR_FF01_UUID, on_notify)
 
-                # Match the original working decode flow as closely as possible:
-                # subscribe, then mostly wait for notifications to arrive.
+                # On BlueZ, start_notify may not correctly enable indications
+                # (vs notifications). Explicitly write the CCCD as a safeguard.
+                await _enable_indications_manually(client, CHAR_FF01_UUID)
+
                 try:
-                    LOG.info("Waiting up to %.1fs for BMS notify frame", frame_timeout)
+                    LOG.info("Waiting up to %.1fs for BMS frame", frame_timeout)
+
+                    # Wait for either a frame or unexpected disconnect
+                    done_tasks = set()
+                    frame_wait = asyncio.ensure_future(got_frame.wait())
+                    disc_wait = asyncio.ensure_future(disconnected_event.wait())
                     try:
-                        await asyncio.wait_for(got_frame.wait(), timeout=frame_timeout)
-                    except asyncio.TimeoutError:
+                        done_tasks, pending = await asyncio.wait(
+                            {frame_wait, disc_wait},
+                            timeout=frame_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        frame_wait.cancel()
+                        disc_wait.cancel()
+
+                    if got_frame.is_set():
+                        LOG.info("Got frame successfully")
+                    elif disconnected_event.is_set():
+                        LOG.warning("Device disconnected while waiting for frame")
+                    else:
+                        # Timeout — try a direct read as fallback
                         LOG.warning(
-                            "No notify frame after %.1fs, trying one fallback FF01 read",
+                            "No frame after %.1fs, trying fallback FF01 read",
                             frame_timeout,
                         )
                         try:
@@ -309,10 +397,7 @@ async def read_once(opts):
                             LOG.debug("Fallback FF01 read failed: %s", exc)
 
                     if not got_frame.is_set():
-                        LOG.warning(
-                            "Timed out waiting %.1fs for BMS frame",
-                            frame_timeout,
-                        )
+                        LOG.warning("Timed out waiting for BMS frame")
                 finally:
                     try:
                         if client.is_connected:
@@ -321,7 +406,15 @@ async def read_once(opts):
                         LOG.debug("Ignoring stop_notify cleanup failure: %s", exc)
 
             last_exc = None
+            if got_frame.is_set():
+                break  # Success — no need to retry
+            # If we connected but got no frame, still retry
+            if connect_attempt < 3:
+                LOG.info("Connected but no frame — retrying after 5s")
+                await asyncio.sleep(5)
+                continue
             break
+
         except Exception as exc:
             last_exc = exc
             LOG.warning("BLE connect/discovery attempt %d failed: %s", connect_attempt, exc)

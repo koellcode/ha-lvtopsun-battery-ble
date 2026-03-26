@@ -1,13 +1,11 @@
-ARG BUILD_FROM
+ARG BUILD_FROM=ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.21
 FROM ${BUILD_FROM}
 
 RUN apk add --no-cache \
-        python3 \
-        py3-pip \
         bluez \
         dbus \
         glib \
-    && pip3 install --no-cache-dir --break-system-packages \
+    && pip install --no-cache-dir \
         bleak==0.22.3 \
         paho-mqtt==2.1.0
 

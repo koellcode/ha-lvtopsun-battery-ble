@@ -10,18 +10,18 @@ Reads SOC (State of Charge) from a LVTOPSUN LiFePO4 battery via BLE and publishe
 
 ## Configuration
 
-| Option | Default | Description |
-|---|---|---|
-| `device_name` | `LLM_UNAZAY_0008FR` | BLE device name (or substring) to search for |
-| `scan_timeout` | `10` | BLE scan timeout in seconds |
-| `connect_timeout` | `15` | BLE connection timeout in seconds |
-| `poll_interval` | `30` | Seconds between SOC reads |
-| `mqtt_host` | *(auto)* | MQTT broker host. Leave empty to auto-discover from Mosquitto add-on |
-| `mqtt_port` | `1883` | MQTT broker port |
-| `mqtt_username` | *(auto)* | MQTT username |
-| `mqtt_password` | *(auto)* | MQTT password |
-| `mqtt_topic` | `lvtopsun_battery` | MQTT topic prefix |
-| `log_level` | `info` | Log level: debug, info, warning, error |
+| Option            | Default             | Description                                                          |
+| ----------------- | ------------------- | -------------------------------------------------------------------- |
+| `device_name`     | `LLM_UNAZAY_0008FR` | BLE device name (or substring) to search for                         |
+| `scan_timeout`    | `10`                | BLE scan timeout in seconds                                          |
+| `connect_timeout` | `15`                | BLE connection timeout in seconds                                    |
+| `poll_interval`   | `30`                | Seconds between SOC reads                                            |
+| `mqtt_host`       | _(auto)_            | MQTT broker host. Leave empty to auto-discover from Mosquitto add-on |
+| `mqtt_port`       | `1883`              | MQTT broker port                                                     |
+| `mqtt_username`   | _(auto)_            | MQTT username                                                        |
+| `mqtt_password`   | _(auto)_            | MQTT password                                                        |
+| `mqtt_topic`      | `lvtopsun_battery`  | MQTT topic prefix                                                    |
+| `log_level`       | `info`              | Log level: debug, info, warning, error                               |
 
 ## MQTT Topics
 
