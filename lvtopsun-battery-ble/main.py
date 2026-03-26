@@ -304,6 +304,7 @@ async def _run_bleak(address: str, connect_timeout: float,
     """
     got_data = False
     data_event = asyncio.Event()
+    decoded_event = asyncio.Event()
 
     def on_indication(_char, data: bytearray):
         nonlocal got_data, last_soc, last_pub_ts
@@ -315,6 +316,7 @@ async def _run_bleak(address: str, connect_timeout: float,
         while not frame_queue.empty():
             try:
                 soc, _v, rx_ts = frame_queue.get_nowait()
+                decoded_event.set()
                 if (soc != last_soc
                         or (rx_ts - last_pub_ts) >= publish_interval):
                     publish_state(mqttc, topic_base, soc)
@@ -348,7 +350,12 @@ async def _run_bleak(address: str, connect_timeout: float,
             try:
                 await asyncio.wait_for(data_event.wait(),
                                        timeout=min(remaining, 10.0))
-                # Got data — extend deadline
+                if decoded_event.is_set():
+                    # Complete frame decoded — drain briefly then exit
+                    LOG.info("Frame decoded, draining for 2s...")
+                    await asyncio.sleep(2)
+                    break
+                # Got indication data but frame not yet complete
                 deadline = time.time() + frame_timeout
             except asyncio.TimeoutError:
                 pass
@@ -387,12 +394,13 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
     assembler = FrameAssembler(on_frame=on_frame)
 
     last_exc = None
-    max_attempts = 5
+    got_any_data = False
+    max_attempts = 10
     for attempt in range(1, max_attempts + 1):
         try:
+            await clear_bluez_cache(address)
             if attempt > 1:
-                await clear_bluez_cache(address)
-                await asyncio.sleep(10)
+                await asyncio.sleep(3)
 
             LOG.info("BLE connect attempt %d/%d to %s",
                      attempt, max_attempts, address)
@@ -404,6 +412,7 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
             )
             if got_data:
                 last_exc = None
+                got_any_data = True
                 break
             LOG.warning("Attempt %d: no indications received",
                         attempt)
@@ -414,7 +423,7 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
 
     if last_exc is not None:
         LOG.error("BLE error after %d attempts: %s", max_attempts, last_exc)
-    return last_soc, last_pub_ts
+    return last_soc, last_pub_ts, got_any_data
 
 
 # ---------------------------------------------------------------------------
@@ -459,11 +468,16 @@ async def run():
 
     try:
         while True:
-            last_soc, last_pub_ts = await connect_and_stream(
+            last_soc, last_pub_ts, got_data = await connect_and_stream(
                 opts, mqttc, topic_base, address, last_soc, last_pub_ts,
             )
-            LOG.info("Reconnecting in %ds", retry_delay)
-            await asyncio.sleep(retry_delay)
+            if got_data:
+                delay = max(int(opts.get("poll_interval", 30)), 1)
+                LOG.info("Next poll in %ds", delay)
+            else:
+                delay = retry_delay
+                LOG.info("Reconnecting in %ds", delay)
+            await asyncio.sleep(delay)
     except asyncio.CancelledError:
         pass
     finally:
