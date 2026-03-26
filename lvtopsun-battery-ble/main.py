@@ -320,6 +320,7 @@ async def _run_gatttool(address: str, connect_timeout: float,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
+    got_data = False
 
     try:
         async def send_cmd(cmd: str):
@@ -406,6 +407,7 @@ async def _run_gatttool(address: str, connect_timeout: float,
                          handle, len(data_bytes))
                 assembler.feed(data_bytes)
                 last_activity = time.time()
+                got_data = True
 
                 while not frame_queue.empty():
                     try:
@@ -435,7 +437,7 @@ async def _run_gatttool(address: str, connect_timeout: float,
         except Exception:
             proc.kill()
 
-    return last_soc, last_pub_ts
+    return last_soc, last_pub_ts, got_data
 
 
 async def connect_and_stream(opts, mqttc, topic_base, address,
@@ -478,13 +480,16 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
             LOG.info("gatttool connect attempt %d/%d to %s",
                      attempt, max_attempts, address)
 
-            last_soc, last_pub_ts = await _run_gatttool(
+            last_soc, last_pub_ts, got_data = await _run_gatttool(
                 address, connect_timeout, frame_timeout,
                 assembler, frame_queue, publish_interval,
                 mqttc, topic_base, last_soc, last_pub_ts,
             )
-            last_exc = None
-            break
+            if got_data:
+                last_exc = None
+                break
+            LOG.warning("gatttool attempt %d: no indications received",
+                        attempt)
 
         except Exception as exc:
             last_exc = exc
