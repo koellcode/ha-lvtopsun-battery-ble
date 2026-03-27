@@ -319,6 +319,7 @@ async def _run_bleak(address: str, connect_timeout: float,
     got_data = False
     data_event = asyncio.Event()
     decoded_event = asyncio.Event()
+    first_burst_timeout = min(frame_timeout, 12.0)
 
     def on_indication(_char, data: bytearray):
         nonlocal got_data, last_soc, last_pub_ts
@@ -349,15 +350,15 @@ async def _run_bleak(address: str, connect_timeout: float,
         await client.start_notify(CHAR_FF01_UUID, on_indication)
         LOG.debug("Subscribed to FF01")
 
-        LOG.debug("Waiting for indications (timeout=%.0fs)...", frame_timeout)
-        deadline = time.time() + frame_timeout
+        LOG.debug("Waiting for first indication (timeout=%.0fs)...", first_burst_timeout)
+        deadline = time.time() + first_burst_timeout
 
         while client.is_connected:
             remaining = deadline - time.time()
             if remaining <= 0:
                 if not got_data:
-                    LOG.warning("No indication for %.0fs; reconnecting",
-                                frame_timeout)
+                    LOG.info("No indication for %.0fs; reconnecting",
+                             first_burst_timeout)
                 break
 
             data_event.clear()
@@ -370,7 +371,7 @@ async def _run_bleak(address: str, connect_timeout: float,
                     await asyncio.sleep(2)
                     break
                 # Got indication data but frame not yet complete
-                deadline = time.time() + frame_timeout
+                deadline = time.time() + min(frame_timeout, 10.0)
             except asyncio.TimeoutError:
                 pass
 
@@ -412,12 +413,12 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
 
     last_exc = None
     got_any_data = False
-    max_attempts = 10
+    max_attempts = 4
     for attempt in range(1, max_attempts + 1):
         try:
             await clear_bluez_cache(address)
             if attempt > 1:
-                await asyncio.sleep(3)
+                await asyncio.sleep(min(2 * attempt, 6))
 
             LOG.debug("BLE connect attempt %d/%d to %s",
                       attempt, max_attempts, address)
@@ -468,6 +469,7 @@ async def run():
     publish_availability(mqttc, topic_base, True)
 
     retry_delay = max(int(opts.get("retry_delay", 10)), 1)
+    failure_streak = 0
     last_soc = None
     last_pub_ts = 0.0
 
@@ -488,11 +490,13 @@ async def run():
                 opts, mqttc, topic_base, address, last_soc, last_pub_ts,
             )
             if got_data:
+                failure_streak = 0
                 delay = max(int(opts.get("poll_interval", 30)), 1)
                 LOG.debug("Next poll in %ds", delay)
             else:
-                delay = retry_delay
-                LOG.info("Reconnecting in %ds", delay)
+                failure_streak += 1
+                delay = min(retry_delay * (2 ** min(failure_streak - 1, 3)), 120)
+                LOG.info("Reconnecting in %ds (failure streak=%d)", delay, failure_streak)
             await asyncio.sleep(delay)
     except asyncio.CancelledError:
         pass
