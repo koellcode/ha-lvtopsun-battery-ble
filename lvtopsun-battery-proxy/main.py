@@ -291,15 +291,6 @@ async def run_proxy(opts):
 
     bms.on_indication = on_bms_indication
 
-    # Start GATT server first so the adapter is already in peripheral mode
-    # before we connect to BMS. Connecting first then starting the server
-    # causes BlueZ to drop the BMS connection when switching to dual mode.
-    await server.start()
-    LOG.info("Proxy advertising as '%s' with device_id='%s'", proxy_name, device_id)
-
-    # Wait for adapter to stabilise in peripheral mode
-    await asyncio.sleep(3)
-
     # Event-driven reconnect: fires immediately on BMS disconnect
     disconnect_event = asyncio.Event()
     bms._disconnect_event = disconnect_event
@@ -318,9 +309,17 @@ async def run_proxy(opts):
             LOG.debug("BMS connect failed: %s", e)
         return False
 
-    # Initial BMS connection (full scan)
-    if not await connect_bms(use_fast=False):
-        LOG.info("Initial BMS connect failed — will keep trying")
+    # Do not advertise until the proxy has a working backend connection.
+    # Otherwise the phone app can connect to a dead-end proxy and time out.
+    LOG.info("Waiting for initial BMS connection before advertising...")
+    while not await connect_bms(use_fast=False):
+        LOG.info("Initial BMS connect failed, retrying in 10s before advertising")
+        await asyncio.sleep(10)
+
+    # Start advertising only after we have seen at least one successful BMS
+    # connection and notification subscription.
+    await server.start()
+    LOG.info("Proxy advertising as '%s' with device_id='%s'", proxy_name, device_id)
 
     LOG.info("Waiting for app to connect... (Ctrl+C to stop)")
 
@@ -342,7 +341,7 @@ async def run_proxy(opts):
                 await asyncio.sleep(reconnect_delay)
                 if await connect_bms(use_fast=True):
                     LOG.debug("BMS reconnected (delay was %ds)", reconnect_delay)
-                    # Keep backoff the same — BMS will likely drop again in ~10s
+                    reconnect_delay = 5
                 else:
                     LOG.info("BMS reconnect failed, next attempt in %ds", reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
@@ -355,6 +354,7 @@ async def run_proxy(opts):
                     await bms.disconnect()
                     if await connect_bms(use_fast=True):
                         LOG.info("BMS reconnected")
+                        reconnect_delay = 5
     except asyncio.CancelledError:
         pass
     finally:
