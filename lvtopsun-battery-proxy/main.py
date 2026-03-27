@@ -61,6 +61,11 @@ def parse_scan_output(output: str, wanted_name: str):
     return fallback_address
 
 
+async def query_known_devices(wanted_name: str):
+    output = await run_command("bluetoothctl", "devices", timeout=10)
+    return parse_scan_output(output, wanted_name)
+
+
 async def resolve_address(opts, cached_address: str | None):
     configured = (opts.get("bms_address") or "").strip()
     if configured:
@@ -70,8 +75,12 @@ async def resolve_address(opts, cached_address: str | None):
 
     timeout = max(int(opts.get("scan_timeout", 15)), 5)
     wanted_name = opts.get("bms_name", "")
+    known = await query_known_devices(wanted_name)
+    if known is not None:
+        return known[0], f"known device {known[1]}"
+
     LOG.info("Scanning for BMS '%s' (%ds) via bluetoothctl...", wanted_name, timeout)
-    output = await run_command(
+    await run_command(
         "bluetoothctl",
         "--timeout",
         str(timeout),
@@ -79,7 +88,7 @@ async def resolve_address(opts, cached_address: str | None):
         "on",
         timeout=timeout + 5,
     )
-    result = parse_scan_output(output, wanted_name)
+    result = await query_known_devices(wanted_name)
     if result is None:
         return None, None
     return result
