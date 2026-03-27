@@ -1,369 +1,202 @@
 #!/usr/bin/env python3
-"""
-LVTOPSUN BLE MITM Proxy for Home Assistant (BlueZ/bless).
-
-Connects to the real BMS via bleak, then advertises as the battery
-using bless (BlueZ GATT server). The phone app connects to this proxy
-instead of the real battery, and all traffic is relayed and logged.
-"""
+"""Minimal LVTOPSUN BLE connection holder using gatttool."""
 
 import asyncio
 import json
 import logging
 import os
+import re
 import sys
-import time
 
-from bleak import BleakClient, BleakScanner
-from bless import (
-    BlessServer,
-    BlessGATTCharacteristic,
-    GATTCharacteristicProperties,
-    GATTAttributePermissions,
-)
 
 LOG = logging.getLogger("proxy")
+DEVICE_LINE_RE = re.compile(
+    r"Device\s+([0-9A-F:]{17})\s*(.*)",
+    re.IGNORECASE,
+)
+CONNECT_SUCCESS = "Connection successful"
 
-# ── Protocol constants (lowercase — BlueZ/bless normalise to lowercase) ─────
-SVC_UUID    = "000000ff-0000-1000-8000-00805f9b34fb"
-FF00_UUID   = "0000ff00-0000-1000-8000-00805f9b34fb"
-FF01_UUID   = "0000ff01-0000-1000-8000-00805f9b34fb"
-DEVINFO_SVC = "0000180a-0000-1000-8000-00805f9b34fb"
-CHAR_MFR    = "00002a29-0000-1000-8000-00805f9b34fb"
-CHAR_MODEL  = "00002a24-0000-1000-8000-00805f9b34fb"
-CHAR_SERIAL = "00002a25-0000-1000-8000-00805f9b34fb"
-CHAR_HWREV  = "00002a27-0000-1000-8000-00805f9b34fb"
-CHAR_FWREV  = "00002a26-0000-1000-8000-00805f9b34fb"
-CHAR_SWREV  = "00002a28-0000-1000-8000-00805f9b34fb"
-
-
-def hexs(data: bytes) -> str:
-    return " ".join(f"{b:02X}" for b in data)
-
-
-# ── Options ──────────────────────────────────────────────────────────────────
 
 def load_options():
     path = "/data/options.json"
     if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
+        with open(path) as handle:
+            return json.load(handle)
     return {
         "bms_name": os.environ.get("BMS_NAME", "LLM_UNAZAY_0008FR"),
-        "proxy_name": os.environ.get("PROXY_NAME", "ASR"),
-        "device_id": os.environ.get("DEVICE_ID", "LVTOPSUNAZAY0008FRF48F1U"),
+        "bms_address": os.environ.get("BMS_ADDRESS", ""),
         "scan_timeout": int(os.environ.get("SCAN_TIMEOUT", "15")),
         "connect_timeout": int(os.environ.get("CONNECT_TIMEOUT", "15")),
+        "keepalive_interval": int(os.environ.get("KEEPALIVE_INTERVAL", "8")),
+        "reconnect_delay": int(os.environ.get("RECONNECT_DELAY", "5")),
         "log_level": os.environ.get("LOG_LEVEL", "info"),
     }
 
 
-# ── BMS client side (bleak) ─────────────────────────────────────────────────
+async def run_command(*args: str, timeout: int | None = None) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    return stdout.decode(errors="replace")
 
-class BMSClient:
-    """Maintains connection to the real BMS and subscribes to FF01."""
 
-    def __init__(self, opts):
-        self.opts = opts
-        self.client = None
-        self.connected = False
-        self.on_indication = None  # callback(data: bytes)
-        self.indication_count = 0
-        self._address = None
-        self._disconnect_event = None  # set by run_proxy
+def parse_scan_output(output: str, wanted_name: str):
+    fallback_address = None
+    wanted = wanted_name.lower()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        match = DEVICE_LINE_RE.search(line)
+        if not match:
+            continue
+        address = match.group(1).upper()
+        name = match.group(2).strip()
+        name_lower = name.lower()
+        if wanted and wanted in name_lower:
+            return address, name or address
+        if name_lower == "asr" and fallback_address is None:
+            fallback_address = (address, name or address)
+    return fallback_address
 
-    def _on_disconnect(self, client):
-        LOG.warning("BMS disconnected (addr=%s)", self._address)
-        self.connected = False
-        if self._disconnect_event:
-            self._disconnect_event.set()
 
-    async def _clear_bluez_cache(self, address):
-        """Remove device from BlueZ to clear cached GATT database."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "bluetoothctl", "remove", address,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-            LOG.info("bluetoothctl remove %s: rc=%d %s",
-                     address, proc.returncode,
-                     (stdout or stderr or b"").decode().strip())
-        except Exception as exc:
-            LOG.debug("bluetoothctl remove failed (non-fatal): %s", exc)
+async def resolve_address(opts, cached_address: str | None):
+    configured = (opts.get("bms_address") or "").strip()
+    if configured:
+        return configured.upper(), "configured address"
+    if cached_address:
+        return cached_address.upper(), "cached address"
 
-    async def connect(self):
-        name = self.opts["bms_name"]
-        timeout = self.opts["scan_timeout"]
-        LOG.info("Scanning for BMS '%s' (%ds)...", name, timeout)
-        devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
-        target = None
-        wanted = name.lower()
-        for dev, adv in devices.values():
-            dname = (dev.name or adv.local_name or "").lower()
-            if wanted in dname or wanted in dev.address.lower():
-                target = dev
-                LOG.info("Found BMS: %s @ %s RSSI=%s", dev.name or adv.local_name, dev.address, adv.rssi)
-                break
-        if target is None:
-            # Fallback: try "ASR"
-            for dev, adv in devices.values():
-                dname = (dev.name or adv.local_name or "").lower()
-                if dname == "asr":
-                    target = dev
-                    LOG.info("Found BMS by fallback 'ASR': %s @ %s", dev.name, dev.address)
-                    break
-        if target is None:
-            LOG.warning("BMS not found")
-            return False
+    timeout = max(int(opts.get("scan_timeout", 15)), 5)
+    wanted_name = opts.get("bms_name", "")
+    LOG.info("Scanning for BMS '%s' (%ds) via bluetoothctl...", wanted_name, timeout)
+    output = await run_command(
+        "bluetoothctl",
+        "--timeout",
+        str(timeout),
+        "scan",
+        "on",
+        timeout=timeout + 5,
+    )
+    result = parse_scan_output(output, wanted_name)
+    if result is None:
+        return None, None
+    return result
 
-        self._address = target.address
 
-        # Clear BlueZ cache to avoid stale GATT data
-        await self._clear_bluez_cache(target.address)
-        await asyncio.sleep(1)
+class GatttoolSession:
+    def __init__(self, address: str, connect_timeout: int, keepalive_interval: int):
+        self.address = address
+        self.connect_timeout = connect_timeout
+        self.keepalive_interval = keepalive_interval
+        self.proc = None
+        self._connected = asyncio.Event()
+        self._done = asyncio.Event()
+        self._reader_task = None
 
-        self.client = BleakClient(
-            target.address,
-            timeout=self.opts["connect_timeout"],
-            disconnected_callback=self._on_disconnect,
+    async def start(self):
+        self.proc = await asyncio.create_subprocess_exec(
+            "gatttool",
+            "-b",
+            self.address,
+            "-t",
+            "public",
+            "-I",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
-        await self.client.connect()
-        LOG.info("Connected to BMS @ %s (MTU=%d)", target.address, self.client.mtu_size)
-
-        await self.client.start_notify(FF01_UUID, self._on_notify)
-        LOG.info("Subscribed to BMS FF01")
-        self.connected = True
-        self.indication_count = 0
-        return True
-
-    async def reconnect(self):
-        """Fast reconnect by known address — skips scan."""
-        if not self._address:
-            LOG.warning("No known BMS address, falling back to full scan")
-            return await self.connect()
-
-        LOG.info("Fast reconnect to %s...", self._address)
-        await self._clear_bluez_cache(self._address)
-        await asyncio.sleep(1)
-
-        self.client = BleakClient(
-            self._address,
-            timeout=self.opts["connect_timeout"],
-            disconnected_callback=self._on_disconnect,
-        )
-        await self.client.connect()
-        LOG.info("Reconnected to BMS @ %s (MTU=%d)", self._address, self.client.mtu_size)
-
-        await self.client.start_notify(FF01_UUID, self._on_notify)
-        LOG.info("Subscribed to BMS FF01")
-        self.connected = True
-        self.indication_count = 0
-        return True
-
-    def _on_notify(self, _sender, data):
-        payload = bytes(data)
-        self.indication_count += 1
-        LOG.info("BMS->proxy %dB (total=%d): %s",
-                 len(payload), self.indication_count, hexs(payload[:20]))
-        if self.on_indication:
-            self.on_indication(payload)
-
-    async def write(self, char_uuid: str, data: bytes):
-        if not self.client or not self.client.is_connected:
-            LOG.warning("BMS not connected, dropping write")
-            return
+        self._reader_task = asyncio.create_task(self._read_output())
+        await self.send("connect")
         try:
-            await self.client.write_gatt_char(char_uuid, data, response=False)
-            LOG.info("proxy->BMS write %s %dB: %s", char_uuid[-4:], len(data), hexs(data))
-        except Exception as e:
-            LOG.error("BMS write failed: %s", e)
+            await asyncio.wait_for(self._connected.wait(), timeout=self.connect_timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("gatttool connect timed out") from exc
+        LOG.info("Connected to %s via gatttool", self.address)
 
-    async def disconnect(self):
-        if self.client:
-            try:
-                await self.client.stop_notify(FF01_UUID)
-            except Exception:
-                pass
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-            self.connected = False
-
-
-# ── GATT server (bless) ─────────────────────────────────────────────────────
-
-async def run_proxy(opts):
-    bms = BMSClient(opts)
-    proxy_name = opts["proxy_name"]
-    device_id = opts["device_id"]
-    loop = asyncio.get_running_loop()
-
-    # Build GATT tree
-    gatt = {
-        # Device Information Service
-        DEVINFO_SVC: {
-            CHAR_MFR: {
-                "Properties": GATTCharacteristicProperties.read,
-                "Permissions": GATTAttributePermissions.readable,
-                "Value": bytearray(b"LVTOPSUN"),
-            },
-            CHAR_MODEL: {
-                "Properties": GATTCharacteristicProperties.read,
-                "Permissions": GATTAttributePermissions.readable,
-                "Value": bytearray(b"AZAY0008FR"),
-            },
-            CHAR_SERIAL: {
-                "Properties": GATTCharacteristicProperties.read,
-                "Permissions": GATTAttributePermissions.readable,
-                "Value": bytearray(device_id.encode("utf-8")),
-            },
-            CHAR_HWREV: {
-                "Properties": GATTCharacteristicProperties.read,
-                "Permissions": GATTAttributePermissions.readable,
-                "Value": bytearray(b"1.0"),
-            },
-            CHAR_FWREV: {
-                "Properties": GATTCharacteristicProperties.read,
-                "Permissions": GATTAttributePermissions.readable,
-                "Value": bytearray(b"1.0"),
-            },
-            CHAR_SWREV: {
-                "Properties": GATTCharacteristicProperties.read,
-                "Permissions": GATTAttributePermissions.readable,
-                "Value": bytearray(b"1.0"),
-            },
-        },
-        # Custom BMS service
-        SVC_UUID: {
-            FF00_UUID: {
-                "Properties": (
-                    GATTCharacteristicProperties.write
-                    | GATTCharacteristicProperties.write_without_response
-                ),
-                "Permissions": GATTAttributePermissions.writeable,
-                "Value": None,
-            },
-            FF01_UUID: {
-                "Properties": (
-                    GATTCharacteristicProperties.read
-                    | GATTCharacteristicProperties.write
-                    | GATTCharacteristicProperties.indicate
-                ),
-                "Permissions": (
-                    GATTAttributePermissions.readable
-                    | GATTAttributePermissions.writeable
-                ),
-                "Value": None,
-            },
-        },
-    }
-
-    def on_read(char: BlessGATTCharacteristic, **kwargs) -> bytearray:
-        LOG.info("App READ %s -> %dB", char.uuid[-4:], len(char.value or b""))
-        return char.value or bytearray()
-
-    def on_write(char: BlessGATTCharacteristic, value, **kwargs):
-        data = bytes(value)
-        char_uuid = str(char.uuid).upper()
-        LOG.info("App WRITE %s %dB: %s", char.uuid[-4:], len(data), hexs(data))
-        # Forward to BMS
-        if bms.connected:
-            asyncio.run_coroutine_threadsafe(bms.write(char_uuid, data), loop)
-
-    server = BlessServer(name=proxy_name, loop=loop)
-    server.read_request_func = on_read
-    server.write_request_func = on_write
-
-    await server.add_gatt(gatt)
-
-    # Relay BMS indications to app
-    def on_bms_indication(data: bytes):
-        ff01_char = server.get_characteristic(FF01_UUID)
-        if ff01_char is None:
-            LOG.warning("FF01 characteristic not found in GATT server (uuid=%s)", FF01_UUID)
-            return
-        ff01_char.value = bytearray(data)
-        LOG.info("proxy->App indicate %dB: %s", len(data), hexs(data[:20]) + ("..." if len(data) > 20 else ""))
-        server.update_value(SVC_UUID, FF01_UUID)
-
-    bms.on_indication = on_bms_indication
-
-    # Event-driven reconnect: fires immediately on BMS disconnect
-    disconnect_event = asyncio.Event()
-    bms._disconnect_event = disconnect_event
-
-    async def connect_bms(use_fast=False):
-        """Try to connect to BMS — single attempt, no retry loop."""
-        try:
-            if use_fast and bms._address:
-                ok = await bms.reconnect()
-            else:
-                ok = await bms.connect()
-            if ok:
-                bms.on_indication = on_bms_indication
-                return True
-        except Exception as e:
-            LOG.debug("BMS connect failed: %s", e)
-        return False
-
-    # Do not advertise until the proxy has a working backend connection.
-    # Otherwise the phone app can connect to a dead-end proxy and time out.
-    LOG.info("Waiting for initial BMS connection before advertising...")
-    while not await connect_bms(use_fast=False):
-        LOG.info("Initial BMS connect failed, retrying in 10s before advertising")
-        await asyncio.sleep(10)
-
-    # Start advertising only after we have seen at least one successful BMS
-    # connection and notification subscription.
-    await server.start()
-    LOG.info("Proxy advertising as '%s' with device_id='%s'", proxy_name, device_id)
-
-    LOG.info("Waiting for app to connect... (Ctrl+C to stop)")
-
-    # The BMS is a low-power BLE device that disconnects after ~10-15s idle.
-    # Data bursts come every 10-20 min. We reconnect with increasing backoff
-    # to avoid spamming the radio. Reset backoff after receiving data.
-    reconnect_delay = 5  # initial delay
-    max_reconnect_delay = 60
-
-    try:
+    async def _read_output(self):
         while True:
-            disconnect_event.clear()
-            # Wait for disconnect or periodic health log (60s)
+            line = await self.proc.stdout.readline()
+            if not line:
+                self._done.set()
+                return
+            text = line.decode(errors="replace").strip()
+            if not text:
+                continue
+            LOG.info("gatttool: %s", text)
+            lower = text.lower()
+            if CONNECT_SUCCESS in text:
+                self._connected.set()
+            if "error" in lower or "disconnected" in lower or "connect error" in lower:
+                self._done.set()
+
+    async def send(self, command: str):
+        if self.proc is None or self.proc.stdin is None:
+            raise RuntimeError("gatttool process is not running")
+        self.proc.stdin.write((command + "\n").encode())
+        await self.proc.stdin.drain()
+
+    async def keepalive(self):
+        while not self._done.is_set():
+            await asyncio.sleep(self.keepalive_interval)
+            if self._done.is_set():
+                break
+            await self.send("char-desc")
+
+    async def wait(self):
+        await self._done.wait()
+
+    async def close(self):
+        if self.proc is not None and self.proc.stdin is not None:
             try:
-                await asyncio.wait_for(disconnect_event.wait(), timeout=60)
-                # BMS disconnected — expected behavior for this BMS
-                LOG.debug("BMS disconnected (normal idle timeout)")
-                await bms.disconnect()
-                await asyncio.sleep(reconnect_delay)
-                if await connect_bms(use_fast=True):
-                    LOG.debug("BMS reconnected (delay was %ds)", reconnect_delay)
-                    reconnect_delay = 5
-                else:
-                    LOG.info("BMS reconnect failed, next attempt in %ds", reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+                await self.send("disconnect")
+            except Exception:
+                pass
+        if self.proc is not None and self.proc.returncode is None:
+            self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), timeout=3)
             except asyncio.TimeoutError:
-                # Periodic health log
-                if bms.client and bms.client.is_connected:
-                    LOG.info("Health: BMS connected, indications=%d", bms.indication_count)
-                else:
-                    LOG.info("Health: BMS not connected, reconnecting...")
-                    await bms.disconnect()
-                    if await connect_bms(use_fast=True):
-                        LOG.info("BMS reconnected")
-                        reconnect_delay = 5
-    except asyncio.CancelledError:
-        pass
-    finally:
-        LOG.info("Shutting down proxy")
-        await server.stop()
-        await bms.disconnect()
+                self.proc.kill()
+                await self.proc.wait()
+        if self._reader_task is not None:
+            await self._reader_task
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+async def run_holder(opts):
+    reconnect_delay = max(int(opts.get("reconnect_delay", 5)), 1)
+    connect_timeout = max(int(opts.get("connect_timeout", 15)), 5)
+    keepalive_interval = max(int(opts.get("keepalive_interval", 8)), 3)
+    cached_address = None
+
+    while True:
+        address = None
+        source = None
+        session = None
+        try:
+            address, source = await resolve_address(opts, cached_address)
+            if not address:
+                LOG.warning("BMS not found, retrying in %ds", reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                continue
+
+            cached_address = address
+            LOG.info("Using BMS address %s (%s)", address, source)
+
+            session = GatttoolSession(address, connect_timeout, keepalive_interval)
+            await session.start()
+            await session.keepalive()
+            await session.wait()
+            LOG.warning("gatttool session ended for %s", address)
+        except Exception as exc:
+            LOG.warning("gatttool session failed: %s", exc)
+        finally:
+            if session is not None:
+                await session.close()
+
+        await asyncio.sleep(reconnect_delay)
+
 
 def main():
     opts = load_options()
@@ -373,13 +206,15 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
-    # Suppress noisy dbus_fast errors from bleak/bless sharing the same D-Bus session
-    logging.getLogger("dbus_fast.message_bus").setLevel(logging.CRITICAL)
-    LOG.info("LVTOPSUN BLE Proxy starting")
-    LOG.info("BMS name: %s  Proxy name: %s  Device ID: %s",
-             opts["bms_name"], opts["proxy_name"], opts["device_id"])
-
-    asyncio.run(run_proxy(opts))
+    LOG.info("LVTOPSUN BLE gatttool holder starting")
+    LOG.info(
+        "Target: %s  Scan: %ss  Connect: %ss  Keepalive: %ss",
+        opts.get("bms_name", ""),
+        opts.get("scan_timeout", 15),
+        opts.get("connect_timeout", 15),
+        opts.get("keepalive_interval", 8),
+    )
+    asyncio.run(run_holder(opts))
 
 
 if __name__ == "__main__":
