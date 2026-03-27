@@ -25,7 +25,7 @@ from bless import (
 LOG = logging.getLogger("proxy")
 
 # ── Protocol constants (lowercase — BlueZ/bless normalise to lowercase) ─────
-SVC_UUID    = "0000ff00-0000-1000-8000-00805f9b34fb"
+SVC_UUID    = "000000ff-0000-1000-8000-00805f9b34fb"
 FF00_UUID   = "0000ff00-0000-1000-8000-00805f9b34fb"
 FF01_UUID   = "0000ff01-0000-1000-8000-00805f9b34fb"
 DEVINFO_SVC = "0000180a-0000-1000-8000-00805f9b34fb"
@@ -305,56 +305,56 @@ async def run_proxy(opts):
     bms._disconnect_event = disconnect_event
 
     async def connect_bms(use_fast=False):
-        """Try to connect to BMS with retries."""
-        for attempt in range(1, 11):
-            try:
-                if use_fast and bms._address:
-                    ok = await bms.reconnect()
-                else:
-                    ok = await bms.connect()
-                if ok:
-                    bms.on_indication = on_bms_indication
-                    return True
-            except Exception as e:
-                LOG.error("BMS connect attempt %d failed: %s", attempt, e)
-            delay = min(3 * attempt, 15)
-            LOG.info("Retrying BMS connect in %ds...", delay)
-            await asyncio.sleep(delay)
-            # After 3 fast-reconnect failures, fall back to full scan
-            if attempt >= 3:
-                use_fast = False
+        """Try to connect to BMS — single attempt, no retry loop."""
+        try:
+            if use_fast and bms._address:
+                ok = await bms.reconnect()
+            else:
+                ok = await bms.connect()
+            if ok:
+                bms.on_indication = on_bms_indication
+                return True
+        except Exception as e:
+            LOG.debug("BMS connect failed: %s", e)
         return False
 
     # Initial BMS connection (full scan)
     if not await connect_bms(use_fast=False):
-        LOG.warning("Initial BMS connect failed — will keep retrying")
+        LOG.info("Initial BMS connect failed — will keep trying")
 
     LOG.info("Waiting for app to connect... (Ctrl+C to stop)")
+
+    # The BMS is a low-power BLE device that disconnects after ~10-15s idle.
+    # Data bursts come every 10-20 min. We reconnect with increasing backoff
+    # to avoid spamming the radio. Reset backoff after receiving data.
+    reconnect_delay = 5  # initial delay
+    max_reconnect_delay = 60
 
     try:
         while True:
             disconnect_event.clear()
-            # Wait for disconnect event or periodic health log (30s)
+            # Wait for disconnect or periodic health log (60s)
             try:
-                await asyncio.wait_for(disconnect_event.wait(), timeout=30)
-                # BMS disconnected — reconnect fast (by address, no scan)
-                LOG.info("BMS disconnect detected — fast reconnect in 2s...")
+                await asyncio.wait_for(disconnect_event.wait(), timeout=60)
+                # BMS disconnected — expected behavior for this BMS
+                LOG.debug("BMS disconnected (normal idle timeout)")
                 await bms.disconnect()
-                await asyncio.sleep(2)
+                await asyncio.sleep(reconnect_delay)
                 if await connect_bms(use_fast=True):
-                    LOG.info("BMS reconnected, indications=%d", bms.indication_count)
+                    LOG.debug("BMS reconnected (delay was %ds)", reconnect_delay)
+                    # Keep backoff the same — BMS will likely drop again in ~10s
                 else:
-                    LOG.warning("BMS reconnect failed — will retry on next cycle")
+                    LOG.info("BMS reconnect failed, next attempt in %ds", reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
             except asyncio.TimeoutError:
                 # Periodic health log
                 if bms.client and bms.client.is_connected:
                     LOG.info("Health: BMS connected, indications=%d", bms.indication_count)
                 else:
-                    LOG.warning("Health: BMS not connected — attempting reconnect...")
+                    LOG.info("Health: BMS not connected, reconnecting...")
                     await bms.disconnect()
-                    await asyncio.sleep(2)
                     if await connect_bms(use_fast=True):
-                        LOG.info("BMS reconnected successfully")
+                        LOG.info("BMS reconnected")
     except asyncio.CancelledError:
         pass
     finally:

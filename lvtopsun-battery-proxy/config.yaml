@@ -1,6 +1,6 @@
 name: "LVTOPSUN Battery BLE Proxy"
 description: "BLE MITM proxy for LVTOPSUN BMS — advertises as the battery so the phone app connects through the Pi"
-version: "0.1.8"
+version: "0.1.9"
 slug: lvtopsun-battery-proxy
 url: "https://github.com/koellcode/ha-lvtopsun-battery-ble"
 arch:
