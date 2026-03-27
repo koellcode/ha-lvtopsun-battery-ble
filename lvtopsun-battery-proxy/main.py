@@ -24,17 +24,17 @@ from bless import (
 
 LOG = logging.getLogger("proxy")
 
-# ── Protocol constants ───────────────────────────────────────────────────────
-SVC_UUID    = "0000FF00-0000-1000-8000-00805F9B34FB"
-FF00_UUID   = "0000FF00-0000-1000-8000-00805F9B34FB"
-FF01_UUID   = "0000FF01-0000-1000-8000-00805F9B34FB"
-DEVINFO_SVC = "0000180A-0000-1000-8000-00805F9B34FB"
-CHAR_MFR    = "00002A29-0000-1000-8000-00805F9B34FB"
-CHAR_MODEL  = "00002A24-0000-1000-8000-00805F9B34FB"
-CHAR_SERIAL = "00002A25-0000-1000-8000-00805F9B34FB"
-CHAR_HWREV  = "00002A27-0000-1000-8000-00805F9B34FB"
-CHAR_FWREV  = "00002A26-0000-1000-8000-00805F9B34FB"
-CHAR_SWREV  = "00002A28-0000-1000-8000-00805F9B34FB"
+# ── Protocol constants (lowercase — BlueZ/bless normalise to lowercase) ─────
+SVC_UUID    = "0000ff00-0000-1000-8000-00805f9b34fb"
+FF00_UUID   = "0000ff00-0000-1000-8000-00805f9b34fb"
+FF01_UUID   = "0000ff01-0000-1000-8000-00805f9b34fb"
+DEVINFO_SVC = "0000180a-0000-1000-8000-00805f9b34fb"
+CHAR_MFR    = "00002a29-0000-1000-8000-00805f9b34fb"
+CHAR_MODEL  = "00002a24-0000-1000-8000-00805f9b34fb"
+CHAR_SERIAL = "00002a25-0000-1000-8000-00805f9b34fb"
+CHAR_HWREV  = "00002a27-0000-1000-8000-00805f9b34fb"
+CHAR_FWREV  = "00002a26-0000-1000-8000-00805f9b34fb"
+CHAR_SWREV  = "00002a28-0000-1000-8000-00805f9b34fb"
 
 
 def hexs(data: bytes) -> str:
@@ -68,6 +68,12 @@ class BMSClient:
         self.client = None
         self.connected = False
         self.on_indication = None  # callback(data: bytes)
+        self.indication_count = 0
+        self._address = None
+
+    def _on_disconnect(self, client):
+        LOG.warning("BMS disconnected (addr=%s)", self._address)
+        self.connected = False
 
     async def connect(self):
         name = self.opts["bms_name"]
@@ -94,18 +100,26 @@ class BMSClient:
             LOG.warning("BMS not found")
             return False
 
-        self.client = BleakClient(target.address, timeout=self.opts["connect_timeout"])
+        self._address = target.address
+        self.client = BleakClient(
+            target.address,
+            timeout=self.opts["connect_timeout"],
+            disconnected_callback=self._on_disconnect,
+        )
         await self.client.connect()
-        LOG.info("Connected to BMS")
+        LOG.info("Connected to BMS @ %s (MTU=%d)", target.address, self.client.mtu_size)
 
         await self.client.start_notify(FF01_UUID, self._on_notify)
         LOG.info("Subscribed to BMS FF01")
         self.connected = True
+        self.indication_count = 0
         return True
 
     def _on_notify(self, _sender, data):
         payload = bytes(data)
-        LOG.debug("BMS->proxy %dB: %s", len(payload), hexs(payload))
+        self.indication_count += 1
+        LOG.info("BMS->proxy %dB (total=%d): %s",
+                 len(payload), self.indication_count, hexs(payload[:20]))
         if self.on_indication:
             self.on_indication(payload)
 
@@ -115,7 +129,7 @@ class BMSClient:
             return
         try:
             await self.client.write_gatt_char(char_uuid, data, response=False)
-            LOG.debug("proxy->BMS write %s %dB", char_uuid[-4:], len(data))
+            LOG.info("proxy->BMS write %s %dB: %s", char_uuid[-4:], len(data), hexs(data))
         except Exception as e:
             LOG.error("BMS write failed: %s", e)
 
@@ -227,6 +241,7 @@ async def run_proxy(opts):
     def on_bms_indication(data: bytes):
         ff01_char = server.get_characteristic(FF01_UUID)
         if ff01_char is None:
+            LOG.warning("FF01 characteristic not found in GATT server (uuid=%s)", FF01_UUID)
             return
         ff01_char.value = bytearray(data)
         LOG.info("proxy->App indicate %dB: %s", len(data), hexs(data[:20]) + ("..." if len(data) > 20 else ""))
@@ -239,8 +254,27 @@ async def run_proxy(opts):
     LOG.info("Waiting for app to connect... (Ctrl+C to stop)")
 
     try:
+        health_interval = 10  # seconds
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(health_interval)
+            # Health check
+            if bms.client and bms.client.is_connected:
+                LOG.info("Health: BMS connected, indications=%d", bms.indication_count)
+            else:
+                if bms.connected:
+                    bms.connected = False
+                LOG.warning("Health: BMS disconnected — attempting reconnect...")
+                try:
+                    await bms.disconnect()
+                    await asyncio.sleep(2)
+                    ok = await bms.connect()
+                    if ok:
+                        bms.on_indication = on_bms_indication
+                        LOG.info("BMS reconnected successfully")
+                    else:
+                        LOG.warning("BMS reconnect failed, will retry in %ds", health_interval)
+                except Exception as e:
+                    LOG.error("BMS reconnect error: %s", e)
     except asyncio.CancelledError:
         pass
     finally:
