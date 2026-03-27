@@ -75,6 +75,21 @@ class BMSClient:
         LOG.warning("BMS disconnected (addr=%s)", self._address)
         self.connected = False
 
+    async def _clear_bluez_cache(self, address):
+        """Remove device from BlueZ to clear cached GATT database."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bluetoothctl", "remove", address,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+            LOG.info("bluetoothctl remove %s: rc=%d %s",
+                     address, proc.returncode,
+                     (stdout or stderr or b"").decode().strip())
+        except Exception as exc:
+            LOG.debug("bluetoothctl remove failed (non-fatal): %s", exc)
+
     async def connect(self):
         name = self.opts["bms_name"]
         timeout = self.opts["scan_timeout"]
@@ -101,6 +116,11 @@ class BMSClient:
             return False
 
         self._address = target.address
+
+        # Clear BlueZ cache to avoid stale GATT data
+        await self._clear_bluez_cache(target.address)
+        await asyncio.sleep(1)
+
         self.client = BleakClient(
             target.address,
             timeout=self.opts["connect_timeout"],
@@ -247,7 +267,21 @@ async def run_proxy(opts):
     # Connect to BMS first, then start advertising.
     # The BMS only allows one connection — we must hold it before the
     # app can see the proxy, otherwise the app connects directly to the BMS.
-    bms_ok = await bms.connect()
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            bms_ok = await bms.connect()
+            if bms_ok:
+                break
+        except Exception as e:
+            LOG.error("BMS connect attempt %d/%d failed: %s", attempt, max_retries, e)
+            bms_ok = False
+        if attempt < max_retries:
+            delay = min(5 * attempt, 30)
+            LOG.info("Retrying BMS connect in %ds...", delay)
+            await asyncio.sleep(delay)
+    else:
+        LOG.warning("All BMS connect attempts failed — starting proxy without BMS")
     if not bms_ok:
         LOG.warning("Running proxy without BMS — app can connect but no data will be relayed")
 
