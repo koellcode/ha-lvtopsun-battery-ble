@@ -50,7 +50,7 @@ def load_options():
             return json.load(f)
     return {
         "bms_name": os.environ.get("BMS_NAME", "LLM_UNAZAY_0008FR"),
-        "proxy_name": os.environ.get("PROXY_NAME", "LLM_UNAZAY_0008FR"),
+        "proxy_name": os.environ.get("PROXY_NAME", "ASR"),
         "device_id": os.environ.get("DEVICE_ID", "LVTOPSUNAZAY0008FRF48F1U"),
         "scan_timeout": int(os.environ.get("SCAN_TIMEOUT", "15")),
         "connect_timeout": int(os.environ.get("CONNECT_TIMEOUT", "15")),
