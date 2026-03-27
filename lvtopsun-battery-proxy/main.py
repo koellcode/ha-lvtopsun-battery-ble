@@ -264,10 +264,17 @@ async def run_proxy(opts):
 
     bms.on_indication = on_bms_indication
 
-    # Connect to BMS first, then start advertising.
-    # The BMS only allows one connection — we must hold it before the
-    # app can see the proxy, otherwise the app connects directly to the BMS.
-    max_retries = 5
+    # Start GATT server first so the adapter is already in peripheral mode
+    # before we connect to BMS. Connecting first then starting the server
+    # causes BlueZ to drop the BMS connection when switching to dual mode.
+    await server.start()
+    LOG.info("Proxy advertising as '%s' with device_id='%s'", proxy_name, device_id)
+
+    # Wait for adapter to stabilise in peripheral mode
+    await asyncio.sleep(3)
+
+    # Now connect to BMS — adapter is already in dual mode
+    max_retries = 10
     for attempt in range(1, max_retries + 1):
         try:
             bms_ok = await bms.connect()
@@ -281,16 +288,16 @@ async def run_proxy(opts):
             LOG.info("Retrying BMS connect in %ds...", delay)
             await asyncio.sleep(delay)
     else:
-        LOG.warning("All BMS connect attempts failed — starting proxy without BMS")
-    if not bms_ok:
-        LOG.warning("Running proxy without BMS — app can connect but no data will be relayed")
+        bms_ok = False
 
-    await server.start()
-    LOG.info("Proxy advertising as '%s' with device_id='%s'", proxy_name, device_id)
+    if not bms_ok:
+        LOG.warning("Initial BMS connect failed — health check will keep trying")
+
     LOG.info("Waiting for app to connect... (Ctrl+C to stop)")
 
     try:
-        health_interval = 10  # seconds
+        health_interval = 5  # seconds
+        reconnect_delay = 3
         while True:
             await asyncio.sleep(health_interval)
             # Health check
@@ -299,10 +306,10 @@ async def run_proxy(opts):
             else:
                 if bms.connected:
                     bms.connected = False
-                LOG.warning("Health: BMS disconnected — attempting reconnect...")
+                LOG.warning("Health: BMS disconnected — attempting reconnect in %ds...", reconnect_delay)
                 try:
                     await bms.disconnect()
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(reconnect_delay)
                     ok = await bms.connect()
                     if ok:
                         bms.on_indication = on_bms_indication
