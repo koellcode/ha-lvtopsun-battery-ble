@@ -70,10 +70,13 @@ class BMSClient:
         self.on_indication = None  # callback(data: bytes)
         self.indication_count = 0
         self._address = None
+        self._disconnect_event = None  # set by run_proxy
 
     def _on_disconnect(self, client):
         LOG.warning("BMS disconnected (addr=%s)", self._address)
         self.connected = False
+        if self._disconnect_event:
+            self._disconnect_event.set()
 
     async def _clear_bluez_cache(self, address):
         """Remove device from BlueZ to clear cached GATT database."""
@@ -273,51 +276,55 @@ async def run_proxy(opts):
     # Wait for adapter to stabilise in peripheral mode
     await asyncio.sleep(3)
 
-    # Now connect to BMS — adapter is already in dual mode
-    max_retries = 10
-    for attempt in range(1, max_retries + 1):
-        try:
-            bms_ok = await bms.connect()
-            if bms_ok:
-                break
-        except Exception as e:
-            LOG.error("BMS connect attempt %d/%d failed: %s", attempt, max_retries, e)
-            bms_ok = False
-        if attempt < max_retries:
-            delay = min(5 * attempt, 30)
+    # Event-driven reconnect: fires immediately on BMS disconnect
+    disconnect_event = asyncio.Event()
+    bms._disconnect_event = disconnect_event
+
+    async def connect_bms():
+        """Try to connect to BMS with retries."""
+        for attempt in range(1, 11):
+            try:
+                ok = await bms.connect()
+                if ok:
+                    bms.on_indication = on_bms_indication
+                    return True
+            except Exception as e:
+                LOG.error("BMS connect attempt %d failed: %s", attempt, e)
+            delay = min(3 * attempt, 15)
             LOG.info("Retrying BMS connect in %ds...", delay)
             await asyncio.sleep(delay)
-    else:
-        bms_ok = False
+        return False
 
-    if not bms_ok:
-        LOG.warning("Initial BMS connect failed — health check will keep trying")
+    # Initial BMS connection
+    if not await connect_bms():
+        LOG.warning("Initial BMS connect failed — will keep retrying")
 
     LOG.info("Waiting for app to connect... (Ctrl+C to stop)")
 
     try:
-        health_interval = 5  # seconds
-        reconnect_delay = 3
         while True:
-            await asyncio.sleep(health_interval)
-            # Health check
-            if bms.client and bms.client.is_connected:
-                LOG.info("Health: BMS connected, indications=%d", bms.indication_count)
-            else:
-                if bms.connected:
-                    bms.connected = False
-                LOG.warning("Health: BMS disconnected — attempting reconnect in %ds...", reconnect_delay)
-                try:
+            disconnect_event.clear()
+            # Wait for disconnect event or periodic health log (30s)
+            try:
+                await asyncio.wait_for(disconnect_event.wait(), timeout=30)
+                # BMS disconnected — reconnect immediately
+                LOG.info("BMS disconnect detected — reconnecting in 2s...")
+                await bms.disconnect()
+                await asyncio.sleep(2)
+                if await connect_bms():
+                    LOG.info("BMS reconnected successfully, indications=%d", bms.indication_count)
+                else:
+                    LOG.warning("BMS reconnect failed — will retry on next cycle")
+            except asyncio.TimeoutError:
+                # Periodic health log
+                if bms.client and bms.client.is_connected:
+                    LOG.info("Health: BMS connected, indications=%d", bms.indication_count)
+                else:
+                    LOG.warning("Health: BMS not connected — attempting reconnect...")
                     await bms.disconnect()
-                    await asyncio.sleep(reconnect_delay)
-                    ok = await bms.connect()
-                    if ok:
-                        bms.on_indication = on_bms_indication
+                    await asyncio.sleep(2)
+                    if await connect_bms():
                         LOG.info("BMS reconnected successfully")
-                    else:
-                        LOG.warning("BMS reconnect failed, will retry in %ds", health_interval)
-                except Exception as e:
-                    LOG.error("BMS reconnect error: %s", e)
     except asyncio.CancelledError:
         pass
     finally:
