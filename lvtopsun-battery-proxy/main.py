@@ -259,6 +259,8 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
+    # Suppress noisy dbus_fast errors from bleak/bless sharing the same D-Bus session
+    logging.getLogger("dbus_fast.message_bus").setLevel(logging.CRITICAL)
     LOG.info("LVTOPSUN BLE Proxy starting")
     LOG.info("BMS name: %s  Proxy name: %s  Device ID: %s",
              opts["bms_name"], opts["proxy_name"], opts["device_id"])
