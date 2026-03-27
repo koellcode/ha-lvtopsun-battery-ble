@@ -15,8 +15,7 @@ DEVICE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 CONNECT_SUCCESS = "Connection successful"
-FF01_CCCD_HANDLE = "0x0028"
-FF01_INDICATION_ENABLE = "0200"
+FF00_HANDLE = "0x0025"
 
 
 def load_options():
@@ -27,6 +26,7 @@ def load_options():
     return {
         "bms_name": os.environ.get("BMS_NAME", "LLM_UNAZAY_0008FR"),
         "bms_address": os.environ.get("BMS_ADDRESS", ""),
+        "ff00_trigger_hex": os.environ.get("FF00_TRIGGER_HEX", "55AA0000"),
         "scan_timeout": int(os.environ.get("SCAN_TIMEOUT", "15")),
         "connect_timeout": int(os.environ.get("CONNECT_TIMEOUT", "15")),
         "keepalive_interval": int(os.environ.get("KEEPALIVE_INTERVAL", "8")),
@@ -97,10 +97,11 @@ async def resolve_address(opts, cached_address: str | None):
 
 
 class GatttoolSession:
-    def __init__(self, address: str, connect_timeout: int, keepalive_interval: int):
+    def __init__(self, address: str, connect_timeout: int, keepalive_interval: int, trigger_hex: str):
         self.address = address
         self.connect_timeout = connect_timeout
         self.keepalive_interval = keepalive_interval
+        self.trigger_hex = trigger_hex.replace(" ", "").upper()
         self.proc = None
         self._connected = asyncio.Event()
         self._done = asyncio.Event()
@@ -125,13 +126,14 @@ class GatttoolSession:
         except asyncio.TimeoutError as exc:
             raise RuntimeError("gatttool connect timed out") from exc
         LOG.info("Connected to %s via gatttool", self.address)
-        await self.enable_indications()
+        await self.send_ff00_trigger()
 
-    async def enable_indications(self):
-        LOG.info("Enabling FF01 indications via CCCD handle %s", FF01_CCCD_HANDLE)
-        await self.send(
-            f"char-write-req {FF01_CCCD_HANDLE} {FF01_INDICATION_ENABLE}"
-        )
+    async def send_ff00_trigger(self):
+        if not self.trigger_hex:
+            LOG.info("FF00 trigger disabled; waiting for spontaneous indications")
+            return
+        LOG.info("Writing FF00 trigger via handle %s: %s", FF00_HANDLE, self.trigger_hex)
+        await self.send(f"char-write-cmd {FF00_HANDLE} {self.trigger_hex}")
 
     async def _read_output(self):
         while True:
@@ -187,6 +189,7 @@ async def run_holder(opts):
     reconnect_delay = max(int(opts.get("reconnect_delay", 5)), 1)
     connect_timeout = max(int(opts.get("connect_timeout", 15)), 5)
     keepalive_interval = max(int(opts.get("keepalive_interval", 8)), 3)
+    trigger_hex = (opts.get("ff00_trigger_hex") or "").strip()
     cached_address = None
 
     while True:
@@ -203,7 +206,7 @@ async def run_holder(opts):
             cached_address = address
             LOG.info("Using BMS address %s (%s)", address, source)
 
-            session = GatttoolSession(address, connect_timeout, keepalive_interval)
+            session = GatttoolSession(address, connect_timeout, keepalive_interval, trigger_hex)
             await session.start()
             await session.keepalive()
             LOG.warning("gatttool session ended for %s", address)
@@ -226,11 +229,12 @@ def main():
     )
     LOG.info("LVTOPSUN BLE gatttool holder starting")
     LOG.info(
-        "Target: %s  Scan: %ss  Connect: %ss  Keepalive: %ss",
+        "Target: %s  Scan: %ss  Connect: %ss  Keepalive: %ss  FF00 trigger: %s",
         opts.get("bms_name", ""),
         opts.get("scan_timeout", 15),
         opts.get("connect_timeout", 15),
         opts.get("keepalive_interval", 8),
+        opts.get("ff00_trigger_hex", ""),
     )
     asyncio.run(run_holder(opts))
 
