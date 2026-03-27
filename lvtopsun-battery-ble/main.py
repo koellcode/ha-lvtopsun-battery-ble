@@ -258,20 +258,33 @@ def publish_availability(mqttc, topic_base, online: bool):
 async def find_device(name: str, timeout: float):
     LOG.info("Scanning for BLE device '%s' (timeout=%ds)...", name, timeout)
     devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+
+    preferred_asr = None
+    preferred_name = None
     for d, adv in devices.values():
         dname = d.name or adv.local_name or ""
-        if name.lower() in dname.lower() or name.lower() in d.address.lower():
-            LOG.info("Found device: %s addr=%s RSSI=%s",
-                     dname, d.address, adv.rssi)
-            return d
-    # Fallback: try "ASR" (known BMS advertising name)
-    if name.lower() != "asr":
-        for d, adv in devices.values():
-            dname = d.name or adv.local_name or ""
-            if "asr" == dname.lower():
-                LOG.info("Found device by fallback 'ASR': %s addr=%s RSSI=%s",
-                         dname, d.address, adv.rssi)
-                return d
+        visible_name = (d.name or "").lower()
+        address = d.address.lower()
+
+        if visible_name == "asr":
+            preferred_asr = (d, adv)
+        if name.lower() in dname.lower() or name.lower() in address:
+            preferred_name = (d, adv)
+
+    if preferred_asr is not None:
+        d, adv = preferred_asr
+        dname = d.name or adv.local_name or ""
+        LOG.info("Found device by preferred name 'ASR': %s addr=%s RSSI=%s",
+                 dname, d.address, adv.rssi)
+        return d
+
+    if preferred_name is not None:
+        d, adv = preferred_name
+        dname = d.name or adv.local_name or ""
+        LOG.info("Found device: %s addr=%s RSSI=%s",
+                 dname, d.address, adv.rssi)
+        return d
+
     return None
 
 
@@ -284,9 +297,10 @@ async def clear_bluez_cache(address: str):
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-        LOG.info("bluetoothctl remove %s: rc=%d %s",
-                 address, proc.returncode,
-                 (stdout or stderr or b"").decode().strip())
+        output = (stdout or stderr or b"").decode().strip().splitlines()
+        summary = output[-1] if output else ""
+        LOG.debug("bluetoothctl remove %s: rc=%d %s",
+                  address, proc.returncode, summary)
     except Exception as exc:
         LOG.debug("bluetoothctl remove failed (non-fatal): %s", exc)
 
@@ -310,7 +324,7 @@ async def _run_bleak(address: str, connect_timeout: float,
         nonlocal got_data, last_soc, last_pub_ts
         got_data = True
         data_event.set()
-        LOG.info("Indication %d bytes", len(data))
+        LOG.debug("Indication %d bytes", len(data))
         assembler.feed(bytes(data))
 
         while not frame_queue.empty():
@@ -327,15 +341,15 @@ async def _run_bleak(address: str, connect_timeout: float,
                 break
 
     async with BleakClient(address, timeout=connect_timeout) as client:
-        LOG.info("Connected to %s (MTU=%d)", address, client.mtu_size)
+        LOG.info("Connected to %s", address)
 
         # Subscribe using start_notify — this writes CCCD and registers
         # the callback. If the BMS disconnects us, we'll catch it.
-        LOG.info("Subscribing to FF01 indications...")
+        LOG.debug("Subscribing to FF01 indications...")
         await client.start_notify(CHAR_FF01_UUID, on_indication)
-        LOG.info("Subscribed to FF01")
+        LOG.debug("Subscribed to FF01")
 
-        LOG.info("Waiting for indications (timeout=%.0fs)...", frame_timeout)
+        LOG.debug("Waiting for indications (timeout=%.0fs)...", frame_timeout)
         deadline = time.time() + frame_timeout
 
         while client.is_connected:
@@ -352,7 +366,7 @@ async def _run_bleak(address: str, connect_timeout: float,
                                        timeout=min(remaining, 10.0))
                 if decoded_event.is_set():
                     # Complete frame decoded — drain briefly then exit
-                    LOG.info("Frame decoded, draining for 2s...")
+                    LOG.debug("Frame decoded, draining for 2s...")
                     await asyncio.sleep(2)
                     break
                 # Got indication data but frame not yet complete
@@ -361,7 +375,10 @@ async def _run_bleak(address: str, connect_timeout: float,
                 pass
 
         if not client.is_connected:
-            LOG.warning("BMS disconnected")
+            if got_data:
+                LOG.debug("BMS disconnected after data burst")
+            else:
+                LOG.info("BMS disconnected before data burst")
 
     return last_soc, last_pub_ts, got_data
 
@@ -386,9 +403,9 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
             return
         voltage = decode_pack_voltage(frame)
         if voltage is not None:
-            LOG.info("Decoded SOC=%d%%, pack=%.2fV", soc, voltage)
+            LOG.debug("Decoded SOC=%d%%, pack=%.2fV", soc, voltage)
         else:
-            LOG.info("Decoded SOC=%d%%", soc)
+            LOG.debug("Decoded SOC=%d%%", soc)
         frame_queue.put_nowait((soc, voltage, time.time()))
 
     assembler = FrameAssembler(on_frame=on_frame)
@@ -402,8 +419,8 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
             if attempt > 1:
                 await asyncio.sleep(3)
 
-            LOG.info("BLE connect attempt %d/%d to %s",
-                     attempt, max_attempts, address)
+            LOG.debug("BLE connect attempt %d/%d to %s",
+                      attempt, max_attempts, address)
 
             last_soc, last_pub_ts, got_data = await _run_bleak(
                 address, connect_timeout, frame_timeout,
@@ -414,12 +431,11 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
                 last_exc = None
                 got_any_data = True
                 break
-            LOG.warning("Attempt %d: no indications received",
-                        attempt)
+            LOG.info("Attempt %d: no indications received", attempt)
 
         except Exception as exc:
             last_exc = exc
-            LOG.warning("Attempt %d failed: %s", attempt, exc)
+            LOG.info("Attempt %d failed: %s", attempt, exc)
 
     if last_exc is not None:
         LOG.error("BLE error after %d attempts: %s", max_attempts, last_exc)
@@ -460,8 +476,8 @@ async def run():
     scan_timeout = opts["scan_timeout"]
     device = await find_device(device_name, scan_timeout)
     while device is None:
-        LOG.warning("Device '%s' not found, retrying in %ds",
-                    device_name, retry_delay)
+        LOG.info("Device '%s' not found, retrying in %ds",
+                 device_name, retry_delay)
         await asyncio.sleep(retry_delay)
         device = await find_device(device_name, scan_timeout)
     address = device.address
@@ -473,7 +489,7 @@ async def run():
             )
             if got_data:
                 delay = max(int(opts.get("poll_interval", 30)), 1)
-                LOG.info("Next poll in %ds", delay)
+                LOG.debug("Next poll in %ds", delay)
             else:
                 delay = retry_delay
                 LOG.info("Reconnecting in %ds", delay)
