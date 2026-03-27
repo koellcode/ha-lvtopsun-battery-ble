@@ -244,20 +244,15 @@ async def run_proxy(opts):
 
     bms.on_indication = on_bms_indication
 
-    # Start GATT server FIRST — bless reconfigures the BlueZ adapter,
-    # which can drop existing connections. By advertising first and
-    # connecting to the BMS after, the adapter is already in dual mode.
-    await server.start()
-    LOG.info("Proxy advertising as '%s' with device_id='%s'", proxy_name, device_id)
-
-    # Give BlueZ a moment to stabilise advertising
-    await asyncio.sleep(2)
-
-    # Now connect to BMS
+    # Connect to BMS first, then start advertising.
+    # The BMS only allows one connection — we must hold it before the
+    # app can see the proxy, otherwise the app connects directly to the BMS.
     bms_ok = await bms.connect()
     if not bms_ok:
         LOG.warning("Running proxy without BMS — app can connect but no data will be relayed")
 
+    await server.start()
+    LOG.info("Proxy advertising as '%s' with device_id='%s'", proxy_name, device_id)
     LOG.info("Waiting for app to connect... (Ctrl+C to stop)")
 
     try:
