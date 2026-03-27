@@ -15,6 +15,8 @@ DEVICE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 CONNECT_SUCCESS = "Connection successful"
+FF01_CCCD_HANDLE = "0x0028"
+FF01_INDICATION_ENABLE = "0200"
 
 
 def load_options():
@@ -123,6 +125,13 @@ class GatttoolSession:
         except asyncio.TimeoutError as exc:
             raise RuntimeError("gatttool connect timed out") from exc
         LOG.info("Connected to %s via gatttool", self.address)
+        await self.enable_indications()
+
+    async def enable_indications(self):
+        LOG.info("Enabling FF01 indications via CCCD handle %s", FF01_CCCD_HANDLE)
+        await self.send(
+            f"char-write-req {FF01_CCCD_HANDLE} {FF01_INDICATION_ENABLE}"
+        )
 
     async def _read_output(self):
         while True:
@@ -137,6 +146,8 @@ class GatttoolSession:
             lower = text.lower()
             if CONNECT_SUCCESS in text:
                 self._connected.set()
+            if "invalid file descriptor" in lower:
+                self._done.set()
             if "error" in lower or "disconnected" in lower or "connect error" in lower:
                 self._done.set()
 

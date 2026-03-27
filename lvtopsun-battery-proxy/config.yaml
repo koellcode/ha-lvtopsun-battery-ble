@@ -1,6 +1,6 @@
 name: "LVTOPSUN Battery BLE Proxy"
 description: "Minimal gatttool-based BLE connection holder for LVTOPSUN BMS"
-version: "0.1.14"
+version: "0.1.15"
 slug: lvtopsun-battery-proxy
 url: "https://github.com/koellcode/ha-lvtopsun-battery-ble"
 arch:
