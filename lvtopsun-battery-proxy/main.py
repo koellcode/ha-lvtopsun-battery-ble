@@ -16,6 +16,8 @@ DEVICE_LINE_RE = re.compile(
 )
 CONNECT_SUCCESS = "Connection successful"
 FF00_HANDLE = "0x0025"
+FF01_CCCD_HANDLE = "0x0028"
+FF01_INDICATION_ENABLE = "0200"
 
 
 def load_options():
@@ -27,6 +29,10 @@ def load_options():
         "bms_name": os.environ.get("BMS_NAME", "LLM_UNAZAY_0008FR"),
         "bms_address": os.environ.get("BMS_ADDRESS", ""),
         "ff00_trigger_hex": os.environ.get("FF00_TRIGGER_HEX", "55AA0000"),
+        "strategy_sequence": os.environ.get(
+            "STRATEGY_SEQUENCE",
+            "none,cccd,ff00,cccd+ff00,ff00+cccd",
+        ),
         "scan_timeout": int(os.environ.get("SCAN_TIMEOUT", "15")),
         "connect_timeout": int(os.environ.get("CONNECT_TIMEOUT", "15")),
         "keepalive_interval": int(os.environ.get("KEEPALIVE_INTERVAL", "8")),
@@ -96,6 +102,15 @@ async def resolve_address(opts, cached_address: str | None):
     return result
 
 
+def parse_strategy_sequence(raw_value: str):
+    strategies = []
+    for item in raw_value.split(","):
+        strategy = item.strip().lower()
+        if strategy:
+            strategies.append(strategy)
+    return strategies or ["none"]
+
+
 class GatttoolSession:
     def __init__(self, address: str, connect_timeout: int, keepalive_interval: int, trigger_hex: str):
         self.address = address
@@ -105,7 +120,9 @@ class GatttoolSession:
         self.proc = None
         self._connected = asyncio.Event()
         self._done = asyncio.Event()
+        self._indication_event = asyncio.Event()
         self._reader_task = None
+        self.indication_count = 0
 
     async def start(self):
         self.proc = await asyncio.create_subprocess_exec(
@@ -126,7 +143,6 @@ class GatttoolSession:
         except asyncio.TimeoutError as exc:
             raise RuntimeError("gatttool connect timed out") from exc
         LOG.info("Connected to %s via gatttool", self.address)
-        await self.send_ff00_trigger()
 
     async def send_ff00_trigger(self):
         if not self.trigger_hex:
@@ -134,6 +150,60 @@ class GatttoolSession:
             return
         LOG.info("Writing FF00 trigger via handle %s: %s", FF00_HANDLE, self.trigger_hex)
         await self.send(f"char-write-cmd {FF00_HANDLE} {self.trigger_hex}")
+
+    async def enable_indications(self):
+        LOG.info("Enabling FF01 indications via CCCD handle %s", FF01_CCCD_HANDLE)
+        await self.send(
+            f"char-write-req {FF01_CCCD_HANDLE} {FF01_INDICATION_ENABLE}"
+        )
+
+    async def run_strategy_sequence(self, strategies: list[str]):
+        for strategy in strategies:
+            if self._done.is_set():
+                break
+            baseline = self.indication_count
+            self._indication_event.clear()
+            LOG.info("Running strategy: %s", strategy)
+            await self.apply_strategy(strategy)
+            await self.wait_after_strategy(strategy, baseline)
+
+    async def apply_strategy(self, strategy: str):
+        if strategy == "none":
+            LOG.info("No GATT action for strategy 'none'")
+            return
+        if strategy == "cccd":
+            await self.enable_indications()
+            return
+        if strategy == "ff00":
+            await self.send_ff00_trigger()
+            return
+        if strategy == "cccd+ff00":
+            await self.enable_indications()
+            await asyncio.sleep(1)
+            if not self._done.is_set():
+                await self.send_ff00_trigger()
+            return
+        if strategy == "ff00+cccd":
+            await self.send_ff00_trigger()
+            await asyncio.sleep(1)
+            if not self._done.is_set():
+                await self.enable_indications()
+            return
+        LOG.warning("Unknown strategy '%s', skipping", strategy)
+
+    async def wait_after_strategy(self, strategy: str, baseline: int):
+        try:
+            await asyncio.wait_for(self._indication_event.wait(), timeout=self.keepalive_interval)
+            LOG.info(
+                "Strategy %s produced indications=%d",
+                strategy,
+                self.indication_count - baseline,
+            )
+        except asyncio.TimeoutError:
+            if self._done.is_set():
+                LOG.info("Strategy %s ended with disconnected session", strategy)
+            else:
+                LOG.info("Strategy %s produced no indication in %ss", strategy, self.keepalive_interval)
 
     async def _read_output(self):
         while True:
@@ -148,6 +218,9 @@ class GatttoolSession:
             lower = text.lower()
             if CONNECT_SUCCESS in text:
                 self._connected.set()
+            if lower.startswith("indication"):
+                self.indication_count += 1
+                self._indication_event.set()
             if "invalid file descriptor" in lower:
                 self._done.set()
             if "error" in lower or "disconnected" in lower or "connect error" in lower:
@@ -190,6 +263,7 @@ async def run_holder(opts):
     connect_timeout = max(int(opts.get("connect_timeout", 15)), 5)
     keepalive_interval = max(int(opts.get("keepalive_interval", 8)), 3)
     trigger_hex = (opts.get("ff00_trigger_hex") or "").strip()
+    strategies = parse_strategy_sequence(opts.get("strategy_sequence", ""))
     cached_address = None
 
     while True:
@@ -208,6 +282,7 @@ async def run_holder(opts):
 
             session = GatttoolSession(address, connect_timeout, keepalive_interval, trigger_hex)
             await session.start()
+            await session.run_strategy_sequence(strategies)
             await session.keepalive()
             LOG.warning("gatttool session ended for %s", address)
         except Exception as exc:
@@ -229,12 +304,13 @@ def main():
     )
     LOG.info("LVTOPSUN BLE gatttool holder starting")
     LOG.info(
-        "Target: %s  Scan: %ss  Connect: %ss  Keepalive: %ss  FF00 trigger: %s",
+        "Target: %s  Scan: %ss  Connect: %ss  Phase wait: %ss  FF00 trigger: %s  Strategies: %s",
         opts.get("bms_name", ""),
         opts.get("scan_timeout", 15),
         opts.get("connect_timeout", 15),
         opts.get("keepalive_interval", 8),
         opts.get("ff00_trigger_hex", ""),
+        opts.get("strategy_sequence", ""),
     )
     asyncio.run(run_holder(opts))
 

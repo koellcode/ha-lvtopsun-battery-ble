@@ -1,6 +1,6 @@
 name: "LVTOPSUN Battery BLE Proxy"
 description: "Minimal gatttool-based BLE connection holder for LVTOPSUN BMS"
-version: "0.1.16"
+version: "0.1.17"
 slug: lvtopsun-battery-proxy
 url: "https://github.com/koellcode/ha-lvtopsun-battery-ble"
 arch:
@@ -15,6 +15,7 @@ options:
   bms_name: "LLM_UNAZAY_0008FR"
   bms_address: ""
   ff00_trigger_hex: "55AA0000"
+  strategy_sequence: "none,cccd,ff00,cccd+ff00,ff00+cccd"
   scan_timeout: 15
   connect_timeout: 15
   keepalive_interval: 8
@@ -24,6 +25,7 @@ schema:
   bms_name: str
   bms_address: str?
   ff00_trigger_hex: str?
+  strategy_sequence: str?
   scan_timeout: int
   connect_timeout: int
   keepalive_interval: int(3,300)
