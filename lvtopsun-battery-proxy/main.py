@@ -138,6 +138,30 @@ class BMSClient:
         self.indication_count = 0
         return True
 
+    async def reconnect(self):
+        """Fast reconnect by known address — skips scan."""
+        if not self._address:
+            LOG.warning("No known BMS address, falling back to full scan")
+            return await self.connect()
+
+        LOG.info("Fast reconnect to %s...", self._address)
+        await self._clear_bluez_cache(self._address)
+        await asyncio.sleep(1)
+
+        self.client = BleakClient(
+            self._address,
+            timeout=self.opts["connect_timeout"],
+            disconnected_callback=self._on_disconnect,
+        )
+        await self.client.connect()
+        LOG.info("Reconnected to BMS @ %s (MTU=%d)", self._address, self.client.mtu_size)
+
+        await self.client.start_notify(FF01_UUID, self._on_notify)
+        LOG.info("Subscribed to BMS FF01")
+        self.connected = True
+        self.indication_count = 0
+        return True
+
     def _on_notify(self, _sender, data):
         payload = bytes(data)
         self.indication_count += 1
@@ -280,11 +304,14 @@ async def run_proxy(opts):
     disconnect_event = asyncio.Event()
     bms._disconnect_event = disconnect_event
 
-    async def connect_bms():
+    async def connect_bms(use_fast=False):
         """Try to connect to BMS with retries."""
         for attempt in range(1, 11):
             try:
-                ok = await bms.connect()
+                if use_fast and bms._address:
+                    ok = await bms.reconnect()
+                else:
+                    ok = await bms.connect()
                 if ok:
                     bms.on_indication = on_bms_indication
                     return True
@@ -293,10 +320,13 @@ async def run_proxy(opts):
             delay = min(3 * attempt, 15)
             LOG.info("Retrying BMS connect in %ds...", delay)
             await asyncio.sleep(delay)
+            # After 3 fast-reconnect failures, fall back to full scan
+            if attempt >= 3:
+                use_fast = False
         return False
 
-    # Initial BMS connection
-    if not await connect_bms():
+    # Initial BMS connection (full scan)
+    if not await connect_bms(use_fast=False):
         LOG.warning("Initial BMS connect failed — will keep retrying")
 
     LOG.info("Waiting for app to connect... (Ctrl+C to stop)")
@@ -307,12 +337,12 @@ async def run_proxy(opts):
             # Wait for disconnect event or periodic health log (30s)
             try:
                 await asyncio.wait_for(disconnect_event.wait(), timeout=30)
-                # BMS disconnected — reconnect immediately
-                LOG.info("BMS disconnect detected — reconnecting in 2s...")
+                # BMS disconnected — reconnect fast (by address, no scan)
+                LOG.info("BMS disconnect detected — fast reconnect in 2s...")
                 await bms.disconnect()
                 await asyncio.sleep(2)
-                if await connect_bms():
-                    LOG.info("BMS reconnected successfully, indications=%d", bms.indication_count)
+                if await connect_bms(use_fast=True):
+                    LOG.info("BMS reconnected, indications=%d", bms.indication_count)
                 else:
                     LOG.warning("BMS reconnect failed — will retry on next cycle")
             except asyncio.TimeoutError:
@@ -323,7 +353,7 @@ async def run_proxy(opts):
                     LOG.warning("Health: BMS not connected — attempting reconnect...")
                     await bms.disconnect()
                     await asyncio.sleep(2)
-                    if await connect_bms():
+                    if await connect_bms(use_fast=True):
                         LOG.info("BMS reconnected successfully")
     except asyncio.CancelledError:
         pass
