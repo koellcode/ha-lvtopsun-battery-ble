@@ -149,9 +149,8 @@ class GatttoolSession:
     async def keepalive(self):
         while not self._done.is_set():
             await asyncio.sleep(self.keepalive_interval)
-            if self._done.is_set():
-                break
-            await self.send("char-desc")
+            if not self._done.is_set():
+                LOG.debug("Session idle for %ss, waiting for peer activity", self.keepalive_interval)
 
     async def wait(self):
         await self._done.wait()
@@ -196,7 +195,6 @@ async def run_holder(opts):
             session = GatttoolSession(address, connect_timeout, keepalive_interval)
             await session.start()
             await session.keepalive()
-            await session.wait()
             LOG.warning("gatttool session ended for %s", address)
         except Exception as exc:
             LOG.warning("gatttool session failed: %s", exc)
