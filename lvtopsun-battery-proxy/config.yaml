@@ -1,0 +1,27 @@
+name: "LVTOPSUN Battery BLE Proxy"
+description: "BLE MITM proxy for LVTOPSUN BMS — advertises as the battery so the phone app connects through the Pi"
+version: "0.1.0"
+slug: lvtopsun-battery-proxy
+url: "https://github.com/koellcode/ha-lvtopsun-battery-ble"
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: manual
+init: false
+host_dbus: true
+host_network: true
+options:
+  bms_name: "LLM_UNAZAY_0008FR"
+  proxy_name: "LLM_UNAZAY_0008FR"
+  device_id: "LVTOPSUNAZAY0008FRF48F1U"
+  scan_timeout: 15
+  connect_timeout: 15
+  log_level: "info"
+schema:
+  bms_name: str
+  proxy_name: str
+  device_id: str
+  scan_timeout: int
+  connect_timeout: int
+  log_level: list(debug|info|warning|error)
