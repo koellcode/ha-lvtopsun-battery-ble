@@ -31,7 +31,7 @@ def load_options():
         "ff00_trigger_hex": os.environ.get("FF00_TRIGGER_HEX", "55AA0000"),
         "strategy_sequence": os.environ.get(
             "STRATEGY_SEQUENCE",
-            "none,cccd,ff00,cccd+ff00,ff00+cccd",
+            "ff00,ff00+cccd,none,cccd,cccd+ff00",
         ),
         "scan_timeout": int(os.environ.get("SCAN_TIMEOUT", "15")),
         "connect_timeout": int(os.environ.get("CONNECT_TIMEOUT", "15")),
