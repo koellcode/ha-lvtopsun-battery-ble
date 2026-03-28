@@ -1,6 +1,6 @@
 name: "LVTOPSUN Battery BLE"
 description: "Reads SOC from LVTOPSUN LiFePO4 battery via BLE and publishes to MQTT"
-version: "0.1.58"
+version: "0.1.59"
 slug: lvtopsun-battery-ble
 url: "https://github.com/koellcode/ha-lvtopsun-battery-ble"
 arch:

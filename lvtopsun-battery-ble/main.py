@@ -320,12 +320,12 @@ def should_clear_cache_for_error(exc: Exception | None) -> bool:
 
 
 async def _run_bleak(address: str, connect_timeout: float,
-                    frame_timeout: float, first_burst_timeout: float,
                     trigger_command: bytes | None,
                     assembler, frame_queue,
                     poll_interval, mqttc, topic_base,
                     last_soc, last_pub_ts):
-    """Connect once, subscribe to FF01, then poll on interval inside the connection."""
+    """Connect once, subscribe to FF01, write trigger, wait indefinitely for indications.
+    Only reconnects when the battery drops the connection."""
     indication_event = asyncio.Event()
 
     def on_indication(_char, data: bytearray):
@@ -354,10 +354,9 @@ async def _run_bleak(address: str, connect_timeout: float,
                 else:
                     raise
 
-        # Poll loop — trigger, wait for data, sleep, repeat inside same connection.
+        # Poll loop — write trigger, wait indefinitely for indication, repeat.
         while client.is_connected:
             indication_event.clear()
-            trigger_retried = False
 
             if trigger_command:
                 LOG.info("Writing trigger to FF00: %s",
@@ -371,36 +370,16 @@ async def _run_bleak(address: str, connect_timeout: float,
                     LOG.info("FF00 write failed: %s", wr_exc)
                     break
 
-            # Wait for an indication within first_burst_timeout.
-            deadline = time.time() + first_burst_timeout
-            got_indication = False
-            while client.is_connected:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                indication_event.clear()
-                try:
-                    await asyncio.wait_for(indication_event.wait(),
-                                           timeout=min(remaining, 3.0))
-                    got_indication = True
-                    await asyncio.sleep(2)  # drain remaining burst packets
-                    break
-                except asyncio.TimeoutError:
-                    if (trigger_command and not trigger_retried
-                            and client.is_connected):
-                        trigger_retried = True
-                        LOG.info("No indication after 3s, re-sending trigger")
-                        try:
-                            await client.write_gatt_char(
-                                CHAR_FF00_UUID, trigger_command, response=True
-                            )
-                            LOG.debug("FF00 re-trigger accepted")
-                        except Exception as rt_exc:
-                            LOG.debug("FF00 re-trigger failed: %s", rt_exc)
+            # Wait for indication — no timeout, only exit on disconnect.
+            LOG.debug("Waiting for indication...")
+            while client.is_connected and not indication_event.is_set():
+                await asyncio.sleep(0.5)
 
-            if not got_indication:
-                LOG.info("No indication received; reconnecting")
+            if not indication_event.is_set():
+                # Battery disconnected before sending data.
                 break
+
+            await asyncio.sleep(2)  # drain remaining burst packets
 
             # Drain frame queue and publish.
             while not frame_queue.empty():
@@ -418,15 +397,14 @@ async def _run_bleak(address: str, connect_timeout: float,
                 LOG.info("Indications received but no decodable frame; reconnecting")
                 break
 
-            # Stay connected and wait for next poll interval.
+            # Wait poll_interval before next trigger, checking for disconnect.
             LOG.debug("Next poll in %ds (connection maintained)", poll_interval)
             poll_end = time.time() + poll_interval
             while client.is_connected and time.time() < poll_end:
                 await asyncio.sleep(min(1.0, poll_end - time.time()))
 
-        if not client.is_connected:
-            LOG.info("BMS disconnected %s",
-                     "after data" if got_first_data else "before first data")
+        LOG.info("BMS disconnected %s",
+                 "after data" if got_first_data else "before first data")
 
     return last_soc, last_pub_ts, got_first_data
 
@@ -477,8 +455,8 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
                       attempt, max_attempts, address)
 
             last_soc, last_pub_ts, got_data = await _run_bleak(
-                address, connect_timeout, frame_timeout,
-                first_burst_timeout, trigger_command,
+                address, connect_timeout,
+                trigger_command,
                 assembler, frame_queue,
                 poll_interval,
                 mqttc, topic_base, last_soc, last_pub_ts,
