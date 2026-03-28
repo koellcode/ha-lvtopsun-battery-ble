@@ -463,15 +463,17 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
     last_exc = None
     got_any_data = False
     max_attempts = int(opts.get("max_connect_attempts", 20))
-    need_cache_clear = True
+    # Clear cache on first attempt only; BlueZ caches GATT for faster reconnects
+    cache_cleared = False
     for attempt in range(1, max_attempts + 1):
         try:
-            if need_cache_clear:
+            if not cache_cleared:
                 await clear_bluez_cache(address)
-                need_cache_clear = False
+                cache_cleared = True
             if attempt > 1:
                 # Fast retry for discovery failures, longer for others
-                delay = 1.0 if last_exc and should_clear_cache_for_error(last_exc) else min(2 * attempt, 6)
+                is_discovery_fail = last_exc and should_clear_cache_for_error(last_exc)
+                delay = 1.0 if is_discovery_fail else min(2 * attempt, 6)
                 await asyncio.sleep(delay)
 
             LOG.debug("BLE connect attempt %d/%d to %s",
@@ -494,8 +496,6 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
         except Exception as exc:
             last_exc = exc
             LOG.info("Attempt %d failed: %s", attempt, exc)
-            if should_clear_cache_for_error(exc) and attempt >= 5:
-                need_cache_clear = True
 
     if last_exc is not None and not got_any_data:
         LOG.error("BLE error after %d attempts: %s", max_attempts, last_exc)
