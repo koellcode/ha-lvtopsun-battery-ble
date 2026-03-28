@@ -1,6 +1,6 @@
 name: "LVTOPSUN Battery BLE"
 description: "Reads SOC from LVTOPSUN LiFePO4 battery via BLE and publishes to MQTT"
-version: "0.1.54"
+version: "0.1.55"
 slug: lvtopsun-battery-ble
 url: "https://github.com/koellcode/ha-lvtopsun-battery-ble"
 arch:
@@ -26,6 +26,7 @@ options:
   mqtt_password: ""
   mqtt_topic: "lvtopsun_battery"
   trigger_command: ""
+  max_connect_attempts: 20
   log_level: "info"
 schema:
   device_name: str
@@ -41,4 +42,5 @@ schema:
   mqtt_password: str?
   mqtt_topic: str
   trigger_command: str?
+  max_connect_attempts: int(4,50)
   log_level: list(debug|info|warning|error)

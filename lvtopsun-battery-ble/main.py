@@ -384,6 +384,7 @@ async def _run_bleak(address: str, connect_timeout: float,
 
         LOG.debug("Waiting for first indication (timeout=%.0fs)...", first_burst_timeout)
         deadline = time.time() + first_burst_timeout
+        trigger_retried = False
 
         while client.is_connected:
             remaining = deadline - time.time()
@@ -396,7 +397,7 @@ async def _run_bleak(address: str, connect_timeout: float,
             data_event.clear()
             try:
                 await asyncio.wait_for(data_event.wait(),
-                                       timeout=min(remaining, 10.0))
+                                       timeout=min(remaining, 3.0))
                 if decoded_event.is_set():
                     # Complete frame decoded — drain briefly then exit
                     LOG.debug("Frame decoded, draining for 2s...")
@@ -405,7 +406,18 @@ async def _run_bleak(address: str, connect_timeout: float,
                 # Got indication data but frame not yet complete
                 deadline = time.time() + min(frame_timeout, 10.0)
             except asyncio.TimeoutError:
-                pass
+                # Re-send trigger once if no data after 3s
+                if (not got_data and trigger_command
+                        and not trigger_retried and client.is_connected):
+                    trigger_retried = True
+                    LOG.info("No indication after 3s, re-sending trigger")
+                    try:
+                        await client.write_gatt_char(
+                            CHAR_FF00_UUID, trigger_command, response=True
+                        )
+                        LOG.debug("FF00 re-trigger accepted")
+                    except Exception as rt_exc:
+                        LOG.debug("FF00 re-trigger failed: %s", rt_exc)
 
         if not client.is_connected:
             if got_data:
@@ -450,12 +462,17 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
 
     last_exc = None
     got_any_data = False
-    max_attempts = 8
+    max_attempts = int(opts.get("max_connect_attempts", 20))
+    need_cache_clear = True
     for attempt in range(1, max_attempts + 1):
         try:
-            await clear_bluez_cache(address)
+            if need_cache_clear:
+                await clear_bluez_cache(address)
+                need_cache_clear = False
             if attempt > 1:
-                await asyncio.sleep(min(2 * attempt, 6))
+                # Fast retry for discovery failures, longer for others
+                delay = 1.0 if last_exc and should_clear_cache_for_error(last_exc) else min(2 * attempt, 6)
+                await asyncio.sleep(delay)
 
             LOG.debug("BLE connect attempt %d/%d to %s",
                       attempt, max_attempts, address)
@@ -471,13 +488,16 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
                 last_exc = None
                 got_any_data = True
                 break
+            last_exc = Exception("no indications received")
             LOG.info("Attempt %d: no indications received", attempt)
 
         except Exception as exc:
             last_exc = exc
             LOG.info("Attempt %d failed: %s", attempt, exc)
+            if should_clear_cache_for_error(exc) and attempt >= 5:
+                need_cache_clear = True
 
-    if last_exc is not None:
+    if last_exc is not None and not got_any_data:
         LOG.error("BLE error after %d attempts: %s", max_attempts, last_exc)
     return last_soc, last_pub_ts, got_any_data
 
