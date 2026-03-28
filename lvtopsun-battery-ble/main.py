@@ -23,6 +23,12 @@ FF01_CCCD_HANDLE  = 0x0028   # FF01 Client Characteristic Config descriptor
 
 LOG = logging.getLogger("lvtopsun")
 
+DISCOVERY_FAILURE_MARKERS = (
+    "failed to discover services",
+    "unlikely error",
+    "not found",
+)
+
 # ---------------------------------------------------------------------------
 # Options — loaded from /data/options.json (HA add-on convention)
 # ---------------------------------------------------------------------------
@@ -305,8 +311,16 @@ async def clear_bluez_cache(address: str):
         LOG.debug("bluetoothctl remove failed (non-fatal): %s", exc)
 
 
+def should_clear_cache_for_error(exc: Exception | None) -> bool:
+    if exc is None:
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in DISCOVERY_FAILURE_MARKERS)
+
+
 async def _run_bleak(address: str, connect_timeout: float,
-                    frame_timeout: float, assembler, frame_queue,
+                    frame_timeout: float, first_burst_timeout: float,
+                    assembler, frame_queue,
                     publish_interval, mqttc, topic_base,
                     last_soc, last_pub_ts):
     """Connect via bleak, write CCCD manually, stream indications.
@@ -319,7 +333,6 @@ async def _run_bleak(address: str, connect_timeout: float,
     got_data = False
     data_event = asyncio.Event()
     decoded_event = asyncio.Event()
-    first_burst_timeout = min(frame_timeout, 12.0)
 
     def on_indication(_char, data: bytearray):
         nonlocal got_data, last_soc, last_pub_ts
@@ -394,6 +407,7 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
     frame_timeout = max(float(opts.get("frame_timeout", 180)), 30.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
+    first_burst_timeout = max(float(opts.get("first_burst_timeout", 12)), 3.0)
 
     frame_queue: asyncio.Queue = asyncio.Queue()
 
@@ -425,7 +439,8 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
 
             last_soc, last_pub_ts, got_data = await _run_bleak(
                 address, connect_timeout, frame_timeout,
-                assembler, frame_queue, publish_interval,
+                first_burst_timeout, assembler, frame_queue,
+                publish_interval,
                 mqttc, topic_base, last_soc, last_pub_ts,
             )
             if got_data:

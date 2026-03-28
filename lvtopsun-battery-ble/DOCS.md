@@ -16,6 +16,7 @@ Reads SOC (State of Charge) from a LVTOPSUN LiFePO4 battery via BLE and publishe
 | `scan_timeout`            | `10`                   | BLE scan timeout in seconds                                          |
 | `connect_timeout`         | `30`                   | BLE connection timeout in seconds                                    |
 | `frame_timeout`           | `120`                  | Maximum time to wait for a telemetry frame before reconnecting       |
+| `first_burst_timeout`     | `12`                   | Seconds to wait for the first BLE indication after connecting        |
 | `poll_interval`           | `30`                   | Minimum interval between MQTT publishes for unchanged SOC            |
 | `retry_delay`             | `10`                   | Delay before opening a new BLE session after disconnect              |
 | `probe_interval`          | `5`                    | Interval used while waiting for frame queue activity                 |

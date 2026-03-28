@@ -17,6 +17,7 @@ options:
   scan_timeout: 10
   connect_timeout: 30
   frame_timeout: 180
+  first_burst_timeout: 12
   poll_interval: 30
   retry_delay: 10
   mqtt_host: ""
@@ -30,6 +31,7 @@ schema:
   scan_timeout: int
   connect_timeout: int
   frame_timeout: int(30,600)
+  first_burst_timeout: int(3,300)
   poll_interval: int
   retry_delay: int(1,300)
   mqtt_host: str?
