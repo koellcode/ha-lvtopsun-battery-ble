@@ -537,14 +537,7 @@ async def run():
             )
             if got_data:
                 failure_streak = 0
-                # Sleep the remaining poll interval (the connection may have polled
-                # internally already, so only sleep what's left since last publish).
-                poll_interval = max(int(opts.get("poll_interval", 300)), 1)
-                elapsed = time.time() - last_pub_ts
-                delay = max(1, poll_interval - int(elapsed))
-                if delay > 1:
-                    LOG.debug("Reconnecting in %ds (last pub %.0fs ago)",
-                              delay, elapsed)
+                delay = retry_delay  # reconnect promptly; poll timing is managed inside the connection
             else:
                 failure_streak += 1
                 delay = min(retry_delay * (2 ** min(failure_streak - 1, 3)), 120)
