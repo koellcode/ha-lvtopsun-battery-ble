@@ -323,38 +323,22 @@ async def _run_bleak(address: str, connect_timeout: float,
                     frame_timeout: float, first_burst_timeout: float,
                     trigger_command: bytes | None,
                     assembler, frame_queue,
-                    publish_interval, mqttc, topic_base,
+                    poll_interval, mqttc, topic_base,
                     last_soc, last_pub_ts):
-    """Connect via bleak, subscribe to FF01, optionally write FF00 trigger."""
-    got_data = False
-    data_event = asyncio.Event()
-    decoded_event = asyncio.Event()
+    """Connect once, subscribe to FF01, then poll on interval inside the connection."""
+    indication_event = asyncio.Event()
 
     def on_indication(_char, data: bytearray):
-        nonlocal got_data, last_soc, last_pub_ts
-        got_data = True
-        data_event.set()
+        indication_event.set()
         LOG.debug("Indication %d bytes", len(data))
         assembler.feed(bytes(data))
 
-        while not frame_queue.empty():
-            try:
-                soc, _v, rx_ts = frame_queue.get_nowait()
-                decoded_event.set()
-                if (soc != last_soc
-                        or (rx_ts - last_pub_ts) >= publish_interval):
-                    publish_state(mqttc, topic_base, soc)
-                    publish_availability(mqttc, topic_base, True)
-                    last_soc = soc
-                    last_pub_ts = rx_ts
-            except asyncio.QueueEmpty:
-                break
+    got_first_data = False
 
     async with BleakClient(address, timeout=connect_timeout) as client:
         LOG.info("Connected to %s", address)
 
-        # Subscribe to FF01 indications.
-        # If start_notify fails (ATT 0x0e), retry after a short delay.
+        # Subscribe to FF01 once for the lifetime of this connection.
         LOG.debug("Subscribing to FF01 indications...")
         for sub_attempt in range(3):
             try:
@@ -370,62 +354,81 @@ async def _run_bleak(address: str, connect_timeout: float,
                 else:
                     raise
 
-        # Write trigger command to FF00 if configured.
-        if trigger_command:
-            LOG.info("Writing trigger to FF00: %s",
-                     trigger_command.hex(' ').upper())
-            try:
-                await client.write_gatt_char(
-                    CHAR_FF00_UUID, trigger_command, response=True
-                )
-                LOG.debug("FF00 write accepted")
-            except Exception as wr_exc:
-                LOG.info("FF00 write failed (continuing): %s", wr_exc)
-
-        LOG.debug("Waiting for first indication (timeout=%.0fs)...", first_burst_timeout)
-        deadline = time.time() + first_burst_timeout
-        trigger_retried = False
-
+        # Poll loop — trigger, wait for data, sleep, repeat inside same connection.
         while client.is_connected:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                if not got_data:
-                    LOG.info("No indication for %.0fs; reconnecting",
-                             first_burst_timeout)
+            indication_event.clear()
+            trigger_retried = False
+
+            if trigger_command:
+                LOG.info("Writing trigger to FF00: %s",
+                         trigger_command.hex(' ').upper())
+                try:
+                    await client.write_gatt_char(
+                        CHAR_FF00_UUID, trigger_command, response=True
+                    )
+                    LOG.debug("FF00 write accepted")
+                except Exception as wr_exc:
+                    LOG.info("FF00 write failed: %s", wr_exc)
+                    break
+
+            # Wait for an indication within first_burst_timeout.
+            deadline = time.time() + first_burst_timeout
+            got_indication = False
+            while client.is_connected:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                indication_event.clear()
+                try:
+                    await asyncio.wait_for(indication_event.wait(),
+                                           timeout=min(remaining, 3.0))
+                    got_indication = True
+                    await asyncio.sleep(2)  # drain remaining burst packets
+                    break
+                except asyncio.TimeoutError:
+                    if (trigger_command and not trigger_retried
+                            and client.is_connected):
+                        trigger_retried = True
+                        LOG.info("No indication after 3s, re-sending trigger")
+                        try:
+                            await client.write_gatt_char(
+                                CHAR_FF00_UUID, trigger_command, response=True
+                            )
+                            LOG.debug("FF00 re-trigger accepted")
+                        except Exception as rt_exc:
+                            LOG.debug("FF00 re-trigger failed: %s", rt_exc)
+
+            if not got_indication:
+                LOG.info("No indication received; reconnecting")
                 break
 
-            data_event.clear()
-            try:
-                await asyncio.wait_for(data_event.wait(),
-                                       timeout=min(remaining, 3.0))
-                if decoded_event.is_set():
-                    # Complete frame decoded — drain briefly then exit
-                    LOG.debug("Frame decoded, draining for 2s...")
-                    await asyncio.sleep(2)
+            # Drain frame queue and publish.
+            while not frame_queue.empty():
+                try:
+                    soc, _v, rx_ts = frame_queue.get_nowait()
+                    publish_state(mqttc, topic_base, soc)
+                    publish_availability(mqttc, topic_base, True)
+                    last_soc = soc
+                    last_pub_ts = rx_ts
+                    got_first_data = True
+                except asyncio.QueueEmpty:
                     break
-                # Got indication data but frame not yet complete
-                deadline = time.time() + min(frame_timeout, 10.0)
-            except asyncio.TimeoutError:
-                # Re-send trigger once if no data after 3s
-                if (not got_data and trigger_command
-                        and not trigger_retried and client.is_connected):
-                    trigger_retried = True
-                    LOG.info("No indication after 3s, re-sending trigger")
-                    try:
-                        await client.write_gatt_char(
-                            CHAR_FF00_UUID, trigger_command, response=True
-                        )
-                        LOG.debug("FF00 re-trigger accepted")
-                    except Exception as rt_exc:
-                        LOG.debug("FF00 re-trigger failed: %s", rt_exc)
+
+            if not got_first_data:
+                LOG.info("Indications received but no decodable frame; reconnecting")
+                break
+
+            # Stay connected and wait for next poll interval.
+            LOG.debug("Next poll in %ds (connection maintained)", poll_interval)
+            poll_end = time.time() + poll_interval
+            while client.is_connected and time.time() < poll_end:
+                await asyncio.sleep(min(1.0, poll_end - time.time()))
 
         if not client.is_connected:
-            if got_data:
-                LOG.debug("BMS disconnected after data burst")
-            else:
-                LOG.info("BMS disconnected before data burst")
+            LOG.info("BMS disconnected %s",
+                     "after data" if got_first_data else "before first data")
 
-    return last_soc, last_pub_ts, got_data
+    return last_soc, last_pub_ts, got_first_data
 
 
 async def connect_and_stream(opts, mqttc, topic_base, address,
@@ -437,7 +440,7 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
     """
     frame_timeout = max(float(opts.get("frame_timeout", 180)), 30.0)
     connect_timeout = max(float(opts.get("connect_timeout", 30)), 5.0)
-    publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
+    poll_interval = max(float(opts.get("poll_interval", 300)), 1.0)
     first_burst_timeout = max(float(opts.get("first_burst_timeout", 12)), 3.0)
 
     # Optional hex command to write to FF00 after subscribing
@@ -477,7 +480,7 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
                 address, connect_timeout, frame_timeout,
                 first_burst_timeout, trigger_command,
                 assembler, frame_queue,
-                publish_interval,
+                poll_interval,
                 mqttc, topic_base, last_soc, last_pub_ts,
             )
             if got_data:
@@ -544,8 +547,14 @@ async def run():
             )
             if got_data:
                 failure_streak = 0
-                delay = max(int(opts.get("poll_interval", 30)), 1)
-                LOG.debug("Next poll in %ds", delay)
+                # Sleep the remaining poll interval (the connection may have polled
+                # internally already, so only sleep what's left since last publish).
+                poll_interval = max(int(opts.get("poll_interval", 300)), 1)
+                elapsed = time.time() - last_pub_ts
+                delay = max(1, poll_interval - int(elapsed))
+                if delay > 1:
+                    LOG.debug("Reconnecting in %ds (last pub %.0fs ago)",
+                              delay, elapsed)
             else:
                 failure_streak += 1
                 delay = min(retry_delay * (2 ** min(failure_streak - 1, 3)), 120)
