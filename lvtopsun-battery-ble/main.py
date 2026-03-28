@@ -264,7 +264,11 @@ def publish_availability(mqttc, topic_base, online: bool):
 
 async def find_device(name: str, timeout: float):
     LOG.info("Scanning for BLE device '%s' (timeout=%ds)...", name, timeout)
-    devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    try:
+        devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    except Exception as scan_exc:
+        LOG.warning("BLE scan failed (adapter may not be ready): %s", scan_exc)
+        return None
 
     preferred_asr = None
     preferred_name = None
