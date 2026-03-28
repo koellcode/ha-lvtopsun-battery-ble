@@ -163,18 +163,18 @@ def decode_pack_voltage(frame: bytes):
 def decode_cycles(frame: bytes):
     """Return charge cycle count from a BMS frame, or None on failure.
 
-    In the 205-byte frame format the cycle counter sits at block[v_off + 58]
-    (verified at frame offset 102, block offset 78, for both known good frames).
+    The cycle counter is the byte immediately before the fixed 3-byte anchor
+    sequence 0x13 0x00 0x70 in the block.  This anchor is stable across frame
+    sizes (199 vs 205 bytes).
     """
     if len(frame) < 70 or frame[:2] != FRAME_MAGIC:
         return None
     block = frame[_BLOCK_BASE:]
-    v_off = _find_pack_voltage_offset(block)
-    if v_off is None:
-        return None
-    off = v_off + 58
-    if off < len(block):
-        return block[off]
+    for i in range(1, len(block) - 2):
+        if block[i] == 0x13 and block[i + 1] == 0x00 and block[i + 2] == 0x70:
+            cycles = block[i - 1]
+            if 0 <= cycles <= 500:
+                return cycles
     return None
 
 
