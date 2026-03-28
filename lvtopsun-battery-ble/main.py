@@ -18,7 +18,8 @@ FRAME_MAGIC = b"\x55\xAA"
 _BLOCK_BASE = 24
 
 # GATT UUIDs and handles
-CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
+CHAR_FF00_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"  # write (command)
+CHAR_FF01_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"  # indicate (response)
 FF01_CCCD_HANDLE  = 0x0028   # FF01 Client Characteristic Config descriptor
 
 LOG = logging.getLogger("lvtopsun")
@@ -320,16 +321,11 @@ def should_clear_cache_for_error(exc: Exception | None) -> bool:
 
 async def _run_bleak(address: str, connect_timeout: float,
                     frame_timeout: float, first_burst_timeout: float,
+                    trigger_command: bytes | None,
                     assembler, frame_queue,
                     publish_interval, mqttc, topic_base,
                     last_soc, last_pub_ts):
-    """Connect via bleak, write CCCD manually, stream indications.
-
-    Instead of using start_notify() (which triggers BlueZ D-Bus
-    StartNotify and caused BMS disconnects), we write the CCCD
-    descriptor directly and rely on bleak's internal notification
-    routing to deliver indication callbacks.
-    """
+    """Connect via bleak, subscribe to FF01, optionally write FF00 trigger."""
     got_data = False
     data_event = asyncio.Event()
     decoded_event = asyncio.Event()
@@ -357,11 +353,34 @@ async def _run_bleak(address: str, connect_timeout: float,
     async with BleakClient(address, timeout=connect_timeout) as client:
         LOG.info("Connected to %s", address)
 
-        # Subscribe using start_notify — this writes CCCD and registers
-        # the callback. If the BMS disconnects us, we'll catch it.
+        # Subscribe to FF01 indications.
+        # If start_notify fails (ATT 0x0e), retry after a short delay.
         LOG.debug("Subscribing to FF01 indications...")
-        await client.start_notify(CHAR_FF01_UUID, on_indication)
-        LOG.debug("Subscribed to FF01")
+        for sub_attempt in range(3):
+            try:
+                await client.start_notify(CHAR_FF01_UUID, on_indication)
+                LOG.debug("Subscribed to FF01 (attempt %d)", sub_attempt + 1)
+                break
+            except Exception as sub_exc:
+                err_msg = str(sub_exc).lower()
+                if ("0x0e" in err_msg or "unlikely" in err_msg) and sub_attempt < 2:
+                    LOG.info("start_notify ATT 0x0e; retrying in 1s (attempt %d/3)",
+                             sub_attempt + 1)
+                    await asyncio.sleep(1)
+                else:
+                    raise
+
+        # Write trigger command to FF00 if configured.
+        if trigger_command:
+            LOG.info("Writing trigger to FF00: %s",
+                     trigger_command.hex(' ').upper())
+            try:
+                await client.write_gatt_char(
+                    CHAR_FF00_UUID, trigger_command, response=True
+                )
+                LOG.debug("FF00 write accepted")
+            except Exception as wr_exc:
+                LOG.info("FF00 write failed (continuing): %s", wr_exc)
 
         LOG.debug("Waiting for first indication (timeout=%.0fs)...", first_burst_timeout)
         deadline = time.time() + first_burst_timeout
@@ -409,6 +428,10 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
     publish_interval = max(float(opts.get("poll_interval", 30)), 1.0)
     first_burst_timeout = max(float(opts.get("first_burst_timeout", 12)), 3.0)
 
+    # Optional hex command to write to FF00 after subscribing
+    trigger_hex = opts.get("trigger_command", "").strip()
+    trigger_command = bytes.fromhex(trigger_hex) if trigger_hex else None
+
     frame_queue: asyncio.Queue = asyncio.Queue()
 
     def on_frame(frame: bytes):
@@ -427,7 +450,7 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
 
     last_exc = None
     got_any_data = False
-    max_attempts = 4
+    max_attempts = 8
     for attempt in range(1, max_attempts + 1):
         try:
             await clear_bluez_cache(address)
@@ -439,7 +462,8 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
 
             last_soc, last_pub_ts, got_data = await _run_bleak(
                 address, connect_timeout, frame_timeout,
-                first_burst_timeout, assembler, frame_queue,
+                first_burst_timeout, trigger_command,
+                assembler, frame_queue,
                 publish_interval,
                 mqttc, topic_base, last_soc, last_pub_ts,
             )
