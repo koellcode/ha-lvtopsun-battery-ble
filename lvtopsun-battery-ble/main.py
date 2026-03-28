@@ -160,6 +160,24 @@ def decode_pack_voltage(frame: bytes):
     return raw / 100.0
 
 
+def decode_cycles(frame: bytes):
+    """Return charge cycle count from a BMS frame, or None on failure.
+
+    In the 205-byte frame format the cycle counter sits at block[v_off + 58]
+    (verified at frame offset 102, block offset 78, for both known good frames).
+    """
+    if len(frame) < 70 or frame[:2] != FRAME_MAGIC:
+        return None
+    block = frame[_BLOCK_BASE:]
+    v_off = _find_pack_voltage_offset(block)
+    if v_off is None:
+        return None
+    off = v_off + 58
+    if off < len(block):
+        return block[off]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # MQTT helpers
 # ---------------------------------------------------------------------------
@@ -236,18 +254,38 @@ def publish_ha_discovery(mqttc, topic_base):
         "device": device_info,
         "availability_topic": f"{topic_base}/availability",
     }
+    cycles_config = {
+        "name": "LVTOPSUN Battery Cycles",
+        "unique_id": "lvtopsun_battery_cycles",
+        "state_topic": f"{topic_base}/state",
+        "value_template": "{{ value_json.cycles }}",
+        "unit_of_measurement": "cycles",
+        "state_class": "total_increasing",
+        "device": device_info,
+        "availability_topic": f"{topic_base}/availability",
+    }
     mqttc.publish(
         "homeassistant/sensor/lvtopsun_battery_soc/config",
         json.dumps(soc_config),
         retain=True,
     )
-    LOG.info("Published HA MQTT discovery for SOC sensor")
+    mqttc.publish(
+        "homeassistant/sensor/lvtopsun_battery_cycles/config",
+        json.dumps(cycles_config),
+        retain=True,
+    )
+    LOG.info("Published HA MQTT discovery for SOC and cycles sensors")
 
 
-def publish_state(mqttc, topic_base, soc):
-    payload = json.dumps({"soc": soc})
-    mqttc.publish(f"{topic_base}/state", payload, retain=True)
-    LOG.info("Published SOC=%d%%", soc)
+def publish_state(mqttc, topic_base, soc, cycles=None):
+    payload = {"soc": soc}
+    if cycles is not None:
+        payload["cycles"] = cycles
+    mqttc.publish(f"{topic_base}/state", json.dumps(payload), retain=True)
+    if cycles is not None:
+        LOG.info("Published SOC=%d%% cycles=%d", soc, cycles)
+    else:
+        LOG.info("Published SOC=%d%%", soc)
 
 
 def publish_availability(mqttc, topic_base, online: bool):
@@ -402,8 +440,8 @@ async def _run_bleak(address: str, connect_timeout: float,
             # Drain frame queue and publish.
             while not frame_queue.empty():
                 try:
-                    soc, _v, rx_ts = frame_queue.get_nowait()
-                    publish_state(mqttc, topic_base, soc)
+                    soc, _v, cycles, rx_ts = frame_queue.get_nowait()
+                    publish_state(mqttc, topic_base, soc, cycles)
                     publish_availability(mqttc, topic_base, True)
                     last_soc = soc
                     last_pub_ts = rx_ts
@@ -445,11 +483,14 @@ async def connect_and_stream(opts, mqttc, topic_base, address,
             LOG.debug("Ignoring %d-byte payload: not decodable", len(frame))
             return
         voltage = decode_pack_voltage(frame)
+        cycles = decode_cycles(frame)
         if voltage is not None:
-            LOG.debug("Decoded SOC=%d%%, pack=%.2fV", soc, voltage)
+            LOG.debug("Decoded SOC=%d%% cycles=%s pack=%.2fV frame=%s",
+                      soc, cycles, voltage, frame.hex(' '))
         else:
-            LOG.debug("Decoded SOC=%d%%", soc)
-        frame_queue.put_nowait((soc, voltage, time.time()))
+            LOG.debug("Decoded SOC=%d%% cycles=%s frame=%s",
+                      soc, cycles, frame.hex(' '))
+        frame_queue.put_nowait((soc, voltage, cycles, time.time()))
 
     assembler = FrameAssembler(on_frame=on_frame)
 
