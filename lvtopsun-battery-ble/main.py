@@ -354,25 +354,39 @@ async def _run_bleak(address: str, connect_timeout: float,
                 else:
                     raise
 
-        # Poll loop — write trigger, wait indefinitely for indication, repeat.
+        # Write trigger once to kick off the stream.
+        if trigger_command:
+            LOG.info("Writing trigger to FF00: %s",
+                     trigger_command.hex(' ').upper())
+            try:
+                await client.write_gatt_char(
+                    CHAR_FF00_UUID, trigger_command, response=True
+                )
+                LOG.debug("FF00 write accepted")
+            except Exception as wr_exc:
+                LOG.info("FF00 write failed: %s", wr_exc)
+
+        # Wait loop — battery may push data autonomously after the first trigger.
+        # Re-trigger only if no indication arrives within poll_interval.
         while client.is_connected:
             indication_event.clear()
 
-            if trigger_command:
-                LOG.info("Writing trigger to FF00: %s",
-                         trigger_command.hex(' ').upper())
-                try:
-                    await client.write_gatt_char(
-                        CHAR_FF00_UUID, trigger_command, response=True
-                    )
-                    LOG.debug("FF00 write accepted")
-                except Exception as wr_exc:
-                    LOG.info("FF00 write failed: %s", wr_exc)
-                    break
-
             # Wait for indication — no timeout, only exit on disconnect.
             LOG.debug("Waiting for indication...")
+            deadline = time.time() + poll_interval
             while client.is_connected and not indication_event.is_set():
+                if time.time() >= deadline:
+                    # No data arrived — re-trigger once and reset deadline.
+                    LOG.info("No indication for %ds, re-sending trigger", poll_interval)
+                    if trigger_command:
+                        try:
+                            await client.write_gatt_char(
+                                CHAR_FF00_UUID, trigger_command, response=True
+                            )
+                            LOG.debug("FF00 re-trigger accepted")
+                        except Exception as rt_exc:
+                            LOG.info("FF00 re-trigger failed: %s", rt_exc)
+                    deadline = time.time() + poll_interval
                 await asyncio.sleep(0.5)
 
             if not indication_event.is_set():
@@ -396,12 +410,6 @@ async def _run_bleak(address: str, connect_timeout: float,
             if not got_first_data:
                 LOG.info("Indications received but no decodable frame; reconnecting")
                 break
-
-            # Wait poll_interval before next trigger, checking for disconnect.
-            LOG.debug("Next poll in %ds (connection maintained)", poll_interval)
-            poll_end = time.time() + poll_interval
-            while client.is_connected and time.time() < poll_end:
-                await asyncio.sleep(min(1.0, poll_end - time.time()))
 
         LOG.info("BMS disconnected %s",
                  "after data" if got_first_data else "before first data")
