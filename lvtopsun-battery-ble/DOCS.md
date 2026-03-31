@@ -10,29 +10,29 @@ Reads SOC (State of Charge) from a LVTOPSUN LiFePO4 battery via BLE and publishe
 
 ## Configuration
 
-| Option                    | Default                | Description                                                          |
-| ------------------------- | ---------------------- | -------------------------------------------------------------------- |
-| `device_name`             | `LLM_UNAZAY_0008FR`    | BLE device name (or substring) to search for                         |
-| `scan_timeout`            | `10`                   | BLE scan timeout in seconds                                          |
-| `connect_timeout`         | `30`                   | BLE connection timeout in seconds                                    |
-| `frame_timeout`           | `120`                  | Maximum time to wait for a telemetry frame before reconnecting       |
-| `first_burst_timeout`     | `12`                   | Seconds to wait for the first BLE indication after connecting        |
-| `poll_interval`           | `30`                   | Minimum interval between MQTT publishes for unchanged SOC            |
-| `retry_delay`             | `10`                   | Delay before opening a new BLE session after disconnect              |
-| `probe_interval`          | `5`                    | Interval used while waiting for frame queue activity                 |
-| `subscribe_settle_delay`  | `0.0`                  | Optional delay before subscribing to `FF01`                          |
-| `post_subscribe_delay`    | `0.0`                  | Optional delay after subscribing before entering stream loop         |
-| `inspect_ff01_descriptors`| `true`                 | Read and log `FF01` descriptor handles and values after subscribe    |
-| `force_ff01_cccd_indicate`| `false`                | Opt-in debug: explicitly write `0x02 0x00` to the `FF01` CCCD        |
-| `ff00_request_hex`        | _(empty)_              | Optional hex payload to write to `FF00` as a telemetry request       |
-| `ff00_request_timing`     | `before-subscribe`     | When to send `ff00_request_hex`: before or after `FF01` subscribe    |
-| `ff00_request_response`   | `false`                | Whether the `FF00` write should request a write response             |
-| `mqtt_host`               | _(auto)_               | MQTT broker host. Leave empty to auto-discover from Mosquitto add-on |
-| `mqtt_port`               | `1883`                 | MQTT broker port                                                     |
-| `mqtt_username`           | _(auto)_               | MQTT username                                                        |
-| `mqtt_password`           | _(auto)_               | MQTT password                                                        |
-| `mqtt_topic`              | `lvtopsun_battery`     | MQTT topic prefix                                                    |
-| `log_level`               | `info`                 | Log level: debug, info, warning, error                               |
+| Option                     | Default             | Description                                                          |
+| -------------------------- | ------------------- | -------------------------------------------------------------------- |
+| `device_name`              | `LLM_UNAZAY_0008FR` | BLE device name (or substring) to search for                         |
+| `scan_timeout`             | `10`                | BLE scan timeout in seconds                                          |
+| `connect_timeout`          | `30`                | BLE connection timeout in seconds                                    |
+| `frame_timeout`            | `120`               | Maximum time to wait for a telemetry frame before reconnecting       |
+| `first_burst_timeout`      | `12`                | Seconds to wait for the first BLE indication after connecting        |
+| `poll_interval`            | `30`                | Minimum interval between MQTT publishes for unchanged SOC            |
+| `retry_delay`              | `10`                | Delay before opening a new BLE session after disconnect              |
+| `probe_interval`           | `5`                 | Interval used while waiting for frame queue activity                 |
+| `subscribe_settle_delay`   | `0.0`               | Optional delay before subscribing to `FF01`                          |
+| `post_subscribe_delay`     | `0.0`               | Optional delay after subscribing before entering stream loop         |
+| `inspect_ff01_descriptors` | `true`              | Read and log `FF01` descriptor handles and values after subscribe    |
+| `force_ff01_cccd_indicate` | `false`             | Opt-in debug: explicitly write `0x02 0x00` to the `FF01` CCCD        |
+| `ff00_request_hex`         | _(empty)_           | Optional hex payload to write to `FF00` as a telemetry request       |
+| `ff00_request_timing`      | `before-subscribe`  | When to send `ff00_request_hex`: before or after `FF01` subscribe    |
+| `ff00_request_response`    | `false`             | Whether the `FF00` write should request a write response             |
+| `mqtt_host`                | _(auto)_            | MQTT broker host. Leave empty to auto-discover from Mosquitto add-on |
+| `mqtt_port`                | `1883`              | MQTT broker port                                                     |
+| `mqtt_username`            | _(auto)_            | MQTT username                                                        |
+| `mqtt_password`            | _(auto)_            | MQTT password                                                        |
+| `mqtt_topic`               | `lvtopsun_battery`  | MQTT topic prefix                                                    |
+| `log_level`                | `info`              | Log level: debug, info, warning, error                               |
 
 ## Current Linux Status
 

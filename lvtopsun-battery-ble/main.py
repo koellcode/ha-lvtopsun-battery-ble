@@ -441,6 +441,10 @@ async def _run_bleak(address: str, connect_timeout: float,
             while not frame_queue.empty():
                 try:
                     soc, _v, cycles, rx_ts = frame_queue.get_nowait()
+                    if last_soc is not None and abs(soc - last_soc) > 5:
+                        LOG.warning("SOC jump %d%%→%d%% (Δ%d%%), skipping",
+                                    last_soc, soc, abs(soc - last_soc))
+                        continue
                     publish_state(mqttc, topic_base, soc, cycles)
                     publish_availability(mqttc, topic_base, True)
                     last_soc = soc
